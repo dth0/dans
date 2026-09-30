@@ -173,6 +173,17 @@ for arg do
 	esac
 done
 
+if [ "${DEV_TEST_TRACE_OPERATIONS:-0}" = 1 ]; then
+	case "$*" in
+		*" recover operator-token "*) operation=recover ;;
+		*" me get"*) operation=validate ;;
+		*" bootstrap "*) operation=bootstrap ;;
+		*) operation=setup ;;
+	esac
+	printf '%s\n' "dev stack contract: operation=$operation start" >&5
+	trap 'printf "%s\n" "dev stack contract: operation=$operation done" >&5' EXIT
+fi
+
 if [ "$mode" = reset-teardown-failure ]; then
 	case "$*" in
 		*down*--volumes*)
@@ -449,6 +460,7 @@ grep -Fq 'development stack lock ownership could not be verified' \
 
 run_scenario() {
 	name=$1
+	printf '%s\n' "dev stack contract: scenario=$name" >&2
 	expected_status=$2
 	expected_token=$3
 	token_state=$4
@@ -493,9 +505,11 @@ run_scenario() {
 		DEV_TEST_BLOCK_TOKEN_MV=$block_mv \
 		DEV_TEST_BLOCK_TOKEN_CHMOD=$block_chmod \
 		DEV_TEST_BLOCK_TOKEN_MKTEMP=$block_mktemp \
+		DEV_TEST_TRACE_OPERATIONS=1 \
+		DANS_DEV_TEST_TRACE_SUPERVISOR=1 \
 		DANS_DEV_LOCK_PUBLISH_DELAY=$publish_delay \
 		PATH="$work/bin:$PATH" \
-		"$fake_root/scripts/dev-stack.sh" up >"$stdout" 2>"$stderr"; then
+		"$fake_root/scripts/dev-stack.sh" up 5>&2 >"$stdout" 2>"$stderr"; then
 		status=0
 	else
 		status=$?

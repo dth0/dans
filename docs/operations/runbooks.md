@@ -36,7 +36,9 @@ Bootstrap is serialized and only initializes an empty installation. There is no 
 
 ## Backup
 
-Use a PostgreSQL role permitted to make backups and a format that the restore procedure has tested. A custom-format example is:
+Back up DANS and authoritative PowerDNS as a coordinated pair. Stop or drain every DANS writer, then coordinate any other permitted PowerDNS writer so neither store changes until both backups are captured. PowerDNS backup steps depend on its configured backend; use that backend's supported consistent-backup procedure, including zone metadata and any key material, and verify the copy can be restored. Do not hot-copy an active SQLite database. The two stores have no shared atomic snapshot, so record their capture times and treat unquiesced copies as potentially inconsistent.
+
+Use a PostgreSQL role permitted to make backups and a format that the restore procedure has tested. A custom-format DANS example is:
 
 ```sh
 umask 077
@@ -45,15 +47,16 @@ pg_restore --list dans-2026-08-14.dump >/dev/null
 sha256sum dans-2026-08-14.dump >dans-2026-08-14.dump.sha256
 ```
 
-Store the dump, checksum, DANS version, and expected schema status together. A DANS backup contains token digests and authorization/audit history and must be protected as security-sensitive data. Regularly restore a copy into an isolated database, run `dans db status` with the matching binary, and verify the expected row counts and constraints before calling the backup verified.
+Store the database dump, its checksum, the matching PowerDNS backup and verification record, DANS version, and expected schema status together under restricted access. Both backups are security-sensitive: DANS contains token digests and authorization/audit history, while PowerDNS may contain DNSSEC or TSIG secrets. Regularly restore both to isolated stores, run `dans db status` with the matching binary, and verify database row counts and constraints plus the deployment's required zones, records, metadata, and keys before calling the pair verified. Keep raw backups and restore diagnostics out of CI-visible output and artifacts.
 
 ## Restore finalization
 
-Never start an API instance against restored state before finalization.
+Never start an API instance against restored state before finalization and authoritative preflight.
 
-1. Stop every DANS API instance and block ingress traffic.
-2. Restore the verified database backup into a clean, isolated database using the matching DANS release and reapply the runtime grants. Keep every DANS instance for that restored database stopped; do not point ingress or a background instance at it yet.
-3. Select an existing enabled operator by UUID or handle and finalize with the runtime database credential:
+1. Stop every DANS API instance and block ingress traffic. Keep other PowerDNS writers quiesced while the backup pair is made or selected.
+2. Restore the verified database backup into a clean, isolated database using the matching DANS release and reapply the runtime grants. Restore the paired PowerDNS backup into a separate authoritative instance using its backend-specific procedure. Keep every DANS instance for these restored stores stopped; do not point ingress or a background instance at them yet.
+3. Before admission, compare the expected zone inventory, required metadata and key material, and representative forward and PTR answers against the captured source inventory. Verify that DANS zone bindings correspond to the restored authoritative zones. If any required item is missing or mismatched, keep DANS stopped and repair or reseed the authoritative copy. These checks sample the deployment's relevant state; they do not prove every record or an atomic cross-store snapshot.
+4. Select an existing enabled operator by UUID or handle and finalize with the runtime database credential:
 
    ```sh
    umask 077
@@ -62,10 +65,10 @@ Never start an API instance against restored state before finalization.
      --confirm >replacement-credential.json
    ```
 
-4. Store the replacement secret immediately. Finalization revokes every token in the restored state and emits exactly one new operator token; all old client secrets must now receive HTTP 401.
-5. Start only the matching release, wait for readiness on every instance, verify the replacement credential authenticates as the same operator, and confirm captured pre-restore credentials receive HTTP 401 before reopening the TLS ingress. Check that expected identity, delegation, and audit history survived the database restore.
+5. Store the replacement secret immediately. Finalization revokes every token in the restored state and emits exactly one new operator token; all old client secrets must now receive HTTP 401.
+6. Configure restored DANS to use only the restored PowerDNS endpoint. Start only the matching release, wait for readiness on every instance, verify the replacement credential authenticates as the same operator, and confirm captured pre-restore credentials receive HTTP 401 before reopening the TLS ingress. Check that expected identity, delegation, and audit history survived the database restore; make one authorized test write and verify it reaches the restored authoritative instance only.
 
-A standard PostgreSQL restore preserves the installation metadata and cannot be recognized automatically as a copy. The stop → restore → offline finalize → start order is therefore an operator-enforced boundary, not a readiness check that detects an accidental early start. The integration gate rehearses this sequence against disposable PostgreSQL 16 and 18 databases, but PowerDNS data backup and recovery remain separate procedures.
+A standard PostgreSQL restore preserves the installation metadata and cannot be recognized automatically as a copy. The stop → paired restore → authoritative preflight → offline finalize → start order is therefore an operator-enforced boundary, not a readiness check that detects an accidental early start or arbitrary mismatched zones. The integration gate rehearses this sequence against disposable PostgreSQL 16 and 18 databases and a SQLite-backed PowerDNS fixture; production PowerDNS backup and recovery remain backend-specific operator procedures.
 
 If finalization fails, keep every instance stopped, preserve its diagnostic and database logs, and retry only after correcting the durable database problem. The command is intentionally unavailable over HTTP.
 
@@ -98,7 +101,7 @@ Recovery cannot create, enable, or promote an identity. Investigate and audit wh
 
 DANS v1 does not support mixed-version rolling upgrades. Follow [coordinated-upgrades.md](coordinated-upgrades.md): verify a backup, drain and stop all old instances, run the target binary's `dans db migrate` with the DDL role, reapply runtime grants, start only the target version, and reopen traffic only after readiness succeeds.
 
-Before a migration, rollback may restart the previous version. After a migration, an in-place binary downgrade is unsupported: restore the matching verified backup, run restore finalization, and start only the matching older binary. Authoritative DNS continues serving while the DANS management plane is unavailable.
+Before a migration, rollback may restart the previous version. After a migration, an in-place binary downgrade is unsupported: restore the matching verified DANS/PowerDNS backup pair, pass authoritative preflight, run restore finalization, and start only the matching older binary. Authoritative DNS continues serving while the DANS management plane is unavailable; if restoring PowerDNS is required, plan its backend-specific availability impact separately.
 
 ## Failed or unknown DNS mutation
 

@@ -228,6 +228,7 @@ chmod 755 "$work/bin/dig"
 
 run_smoke() {
 	mode=$1
+	printf '%s\n' "host smoke contract: scenario=$mode" >&2
 	http_port=$2
 	udp_port=$3
 	tcp_port=$4
@@ -302,6 +303,7 @@ run_smoke port-malformed 8080 1053 1053 1 'invalid port'
 run_smoke port-udp-fail 8080 1053 1053 1 'port lookup failed for powerdns 53'
 run_smoke port-tcp-fail 8080 1053 1053 1 'port lookup failed for powerdns 53'
 
+printf '%s\n' 'host smoke contract: scenario=missing-tool' >&2
 missing_bin=$work/missing-bin
 mkdir -p "$missing_bin"
 ln -s "$(command -v dirname)" "$missing_bin/dirname"

@@ -29,6 +29,7 @@ done
 major_minor=${postgres_image#postgres:}
 project=dans-qa-$(printf '%s' "$major_minor" | tr . -)-$$
 work=$(mktemp -d "${TMPDIR:-/tmp}/dans-qa.XXXXXX")
+chmod 700 "$work"
 log_dir=${DANS_QA_LOG_DIR:-$work/logs}
 export POSTGRES_IMAGE=$postgres_image
 export DANS_IMAGE=dans-integration:$project
@@ -36,6 +37,7 @@ port_base=${DANS_QA_PORT_BASE:-$(( 20000 + ($$ % 20000) ))}
 export DANS_A_PORT=${DANS_A_PORT:-$port_base}
 export DANS_B_PORT=${DANS_B_PORT:-$(( port_base + 1 ))}
 export POWERDNS_PORT=${POWERDNS_PORT:-$(( port_base + 2 ))}
+export POWERDNS_RESTORED_PORT=${POWERDNS_RESTORED_PORT:-$(( port_base + 5 ))}
 export DANS_BAD_KEY_PORT=${DANS_BAD_KEY_PORT:-$(( port_base + 3 ))}
 export DANS_RESTORED_PORT=${DANS_RESTORED_PORT:-$(( port_base + 4 ))}
 footprint_container=
@@ -70,10 +72,19 @@ cleanup() {
 		compose --profile faults --profile tools --profile restore down --volumes --remove-orphans >/dev/null 2>&1 || true
 		docker image rm "$DANS_IMAGE" >/dev/null 2>&1 || true
 	fi
+	rm -rf "$work/powerdns"
 	if [ -z "${DANS_QA_LOG_DIR:-}" ]; then
 		rm -rf "$work"
 	fi
 	exit "$status"
+}
+
+seed_restored_powerdns() {
+	docker run --rm --network none --user 0 --entrypoint sh \
+		-v "$work:/backup:ro" \
+		-v "${project}_powerdns_restored:/var/lib/powerdns" \
+		powerdns/pdns-auth-51:5.1.3 -ec \
+		'rm -f /var/lib/powerdns/pdns.sqlite3-wal /var/lib/powerdns/pdns.sqlite3-shm /var/lib/powerdns/pdns.sqlite3-journal; cp /backup/powerdns/pdns.sqlite3* /var/lib/powerdns/; chown pdns:pdns /var/lib/powerdns/pdns.sqlite3*; chmod 600 /var/lib/powerdns/pdns.sqlite3*' >/dev/null
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -146,6 +157,14 @@ pdns_cli_data() {
 	printf '%s\n' "$data" | pdns_cli "$@" --data=-
 }
 
+pdns_cli_restored() {
+	compose run --rm --no-deps -T \
+		-e DANS_ENDPOINT=http://powerdns-restored:8081/api/v1 \
+		-e DANS_API_TOKEN=dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+		-e DANS_OUTPUT=json \
+		dans-a "$@"
+}
+
 expect_cli_error() {
 	label=$1
 	expected=$2
@@ -176,6 +195,67 @@ query_dns() {
 	type=$2
 	dig @127.0.0.1 -p "$dns_port" +time=2 +tries=1 +noall +answer "$name" "$type"
 }
+
+dns_values() {
+	dig @127.0.0.1 -p "$1" +time=2 +tries=1 +short "$2" "$3" | sort
+}
+
+restored_dans_stopped() {
+	restored_containers=$(compose --profile restore ps --quiet dans-restored) || return 1
+	[ -z "$restored_containers" ]
+}
+
+recovery_preflight() {
+	printf '%s\n' stopped >"$work/preflight-step"
+	restored_dans_stopped || return 1
+	printf '%s\n' zones >"$work/preflight-step"
+	restored_zones_json=$(pdns_cli_restored zones list 2>"$work/preflight.err") || return 1
+	restored_zone_ids=$(printf '%s' "$restored_zones_json" | jq -c '[.[].id] | sort') || return 1
+	[ "$restored_zone_ids" = "$source_zone_ids" ] || return 1
+	printf '%s\n' metadata >"$work/preflight-step"
+	restored_metadata=$(compose exec -T powerdns-restored pdnsutil metadata get example.test. ALLOW-AXFR-FROM 2>"$work/preflight.err") || return 1
+	[ "$restored_metadata" = "$source_metadata" ] || return 1
+	printf '%s\n' forward >"$work/preflight-step"
+	[ "$(dns_values "$restored_dns_port" host.shared.example.test. A)" = "$source_forward" ] || return 1
+	printf '%s\n' ptr >"$work/preflight-step"
+	[ "$(dns_values "$restored_dns_port" 10.2.0.192.in-addr.arpa. PTR)" = "$source_ptr" ] || return 1
+	printf '%s\n' passed >"$work/preflight-step"
+}
+
+assert_recovery_preflight() {
+	if recovery_preflight 2>"$work/preflight-detail.err"; then
+		return 0
+	fi
+	printf '%s\n' 'integration: restored PowerDNS preflight mismatch' >&2
+	return 1
+}
+
+expect_preflight_rejection() {
+	preflight_label=$1
+	preflight_stage=$2
+	shift 2
+	if "$@" >"$work/preflight-rejection.out" 2>"$work/preflight-rejection.err"; then
+		fail "$preflight_label unexpectedly passed preflight"
+	fi
+	grep -Fxq 'integration: restored PowerDNS preflight mismatch' "$work/preflight-rejection.err" || fail "$preflight_label did not report the fixed rejection label"
+	[ ! -s "$work/preflight-rejection.out" ] || fail "$preflight_label emitted unexpected output"
+	[ "$(sed -n '1p' "$work/preflight-step")" = "$preflight_stage" ] || fail "$preflight_label rejected at the wrong gate"
+}
+
+expect_compose_query_rejection() (
+	preflight_compose_mode=$1
+	compose() {
+		case " $* " in
+			*' ps --quiet dans-restored '*)
+				[ "$preflight_compose_mode" != failed ] || return 1
+				printf '%s\n' running
+				return 0
+				;;
+		esac
+		docker compose --project-name "$project" --file "$compose_file" "$@"
+	}
+	expect_preflight_rejection "$preflight_compose_mode Compose query" stopped assert_recovery_preflight
+)
 
 assert_dns_contains() {
 	name=$1
@@ -474,28 +554,8 @@ if grep -Eqi '(^|[[:space:]])(seed|reset|fault|introspect|metrics|pprof|profil|b
 	fail 'production CLI exposes a test-only command'
 fi
 
-mark_phase restore
-[ -z "$(compose --profile restore ps --quiet dans-restored)" ] || fail 'restored service started before finalization'
-snapshot_sql='SELECT installation_id, (SELECT count(*) FROM identities), (SELECT count(*) FROM groups), (SELECT count(*) FROM delegations), (SELECT count(*) FROM audit_events) FROM installation_metadata'
-source_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$snapshot_sql")
-[ -n "$source_snapshot" ] || fail 'source database snapshot is empty'
-source_populated=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c 'SELECT EXISTS(SELECT 1 FROM identities) AND EXISTS(SELECT 1 FROM delegations) AND EXISTS(SELECT 1 FROM audit_events)')
-[ "$source_populated" = t ] || fail 'source database lacks restore fixtures'
-compose exec -T postgres sh -c 'umask 077; pg_dump --format=custom -U dans_ddl -d dans --file=/tmp/dans-restore.dump'
-compose exec -T postgres test -s /tmp/dans-restore.dump || fail 'database backup is empty'
-compose exec -T postgres createdb -U dans_ddl -O dans_ddl dans_restored
-compose exec -T postgres pg_restore --exit-on-error --no-owner --no-acl -U dans_ddl -d dans_restored /tmp/dans-restore.dump
-compose exec -T postgres rm -f /tmp/dans-restore.dump
-compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored \
-	--set=database_name=dans_restored --set=schema_name=public --set=runtime_role=dans_runtime \
-	--file=/dans/runtime.sql >/dev/null
-restored_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$snapshot_sql")
-[ "$restored_snapshot" = "$source_snapshot" ] || fail 'restored identity, authority, or audit state differs from backup'
-preexisting_finalizations=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
-[ "$preexisting_finalizations" -eq 0 ] || fail 'restored fixture already contains a finalization event'
-historical_audit_id=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT id FROM audit_events ORDER BY occurred_at, id LIMIT 1')
 preserved_state() {
-	compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT md5(jsonb_build_object(
+	compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d "$1" -c "SELECT md5(jsonb_build_object(
 		'identities', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM identities t),
 		'groups', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM groups t),
 		'memberships', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM group_memberships t),
@@ -507,7 +567,88 @@ preserved_state() {
 		'audit', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM audit_events t WHERE action <> 'restore.finalize')
 	)::text)"
 }
-preserved_before=$(preserved_state)
+
+mark_phase restore
+restored_dans_stopped || fail 'restored service started before finalization'
+source_zones_json=$(pdns_cli zones list)
+source_zone_ids=$(printf '%s' "$source_zones_json" | jq -c '[.[].id] | sort')
+printf '%s' "$source_zones_json" | jq -e --arg forward "$forward_zone_id" --arg reverse "$reverse_zone_id" \
+	'any(.[]; .id == $forward) and any(.[]; .id == $reverse)' >/dev/null || fail 'source PowerDNS zones are incomplete'
+source_metadata=$(compose exec -T powerdns pdnsutil metadata get example.test. ALLOW-AXFR-FROM)
+printf '%s' "$source_metadata" | grep -Fq '192.0.2.0/24' || fail 'source PowerDNS metadata is incomplete'
+source_forward=$(dns_values "$dns_port" host.shared.example.test. A)
+[ "$source_forward" = 192.0.2.47 ] || fail 'source forward DNS fixture is incomplete'
+source_ptr=$(dns_values "$dns_port" 10.2.0.192.in-addr.arpa. PTR)
+[ "$source_ptr" = host.shared.example.test. ] || fail 'source PTR DNS fixture is incomplete'
+snapshot_sql='SELECT installation_id, (SELECT count(*) FROM identities), (SELECT count(*) FROM groups), (SELECT count(*) FROM delegations), (SELECT count(*) FROM audit_events) FROM installation_metadata'
+source_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$snapshot_sql")
+[ -n "$source_snapshot" ] || fail 'source database snapshot is empty'
+source_populated=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c 'SELECT EXISTS(SELECT 1 FROM identities) AND EXISTS(SELECT 1 FROM delegations) AND EXISTS(SELECT 1 FROM audit_events)')
+[ "$source_populated" = t ] || fail 'source database lacks restore fixtures'
+compose stop dans-a dans-b >/dev/null
+source_preserved=$(preserved_state dans)
+token_sql="SELECT md5(COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)), '[]'::jsonb)::text) FROM api_tokens t"
+source_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$token_sql")
+compose exec -T postgres sh -c 'umask 077; pg_dump --format=custom -U dans_ddl -d dans --file=/tmp/dans-restore.dump'
+compose exec -T postgres test -s /tmp/dans-restore.dump || fail 'database backup is empty'
+compose stop powerdns >/dev/null
+source_powerdns_container=$(compose ps --all --quiet powerdns)
+[ -n "$source_powerdns_container" ] || fail 'source PowerDNS container is unavailable'
+mkdir -m 700 "$work/powerdns"
+docker cp "$source_powerdns_container:/var/lib/powerdns/." "$work/powerdns/" >/dev/null
+chmod 600 "$work/powerdns/"*
+[ -s "$work/powerdns/pdns.sqlite3" ] || fail 'PowerDNS backup is empty'
+compose start powerdns >/dev/null
+compose --profile restore create powerdns-restored >/dev/null
+seed_restored_powerdns
+compose --profile restore start powerdns-restored >/dev/null
+restored_dns_port=$(compose --profile restore port --protocol udp powerdns-restored 53 | awk -F: 'END { print $NF }')
+wait_for 'restored PowerDNS startup' pdns_cli_restored zones list
+assert_recovery_preflight || exit 1
+expect_compose_query_rejection failed
+expect_compose_query_rejection running
+(
+	pdns_cli_restored() { return 1; }
+	expect_preflight_rejection 'unavailable PowerDNS API' zones assert_recovery_preflight
+)
+(
+	source_zone_ids='[]'
+	expect_preflight_rejection 'wrong zone inventory' zones assert_recovery_preflight
+)
+(
+	source_forward=198.51.100.1
+	expect_preflight_rejection 'wrong forward answer' forward assert_recovery_preflight
+)
+(
+	source_ptr=wrong.example.test.
+	expect_preflight_rejection 'wrong PTR answer' ptr assert_recovery_preflight
+)
+compose exec -T powerdns-restored pdnsutil metadata set example.test. ALLOW-AXFR-FROM 198.51.100.0/24 >/dev/null
+mismatched_metadata=$(compose exec -T powerdns-restored pdnsutil metadata get example.test. ALLOW-AXFR-FROM)
+[ "$mismatched_metadata" != "$source_metadata" ] || fail 'mismatched PowerDNS fixture was not applied'
+expect_preflight_rejection 'mismatched PowerDNS fixture' metadata assert_recovery_preflight
+restored_dans_stopped || fail 'restored DANS started after preflight rejection'
+compose --profile restore stop powerdns-restored >/dev/null
+seed_restored_powerdns
+compose --profile restore start powerdns-restored >/dev/null
+wait_for 'restored PowerDNS restart' pdns_cli_restored zones list
+assert_recovery_preflight || exit 1
+compose exec -T postgres createdb -U dans_ddl -O dans_ddl dans_restored
+compose exec -T postgres pg_restore --exit-on-error --no-owner --no-acl -U dans_ddl -d dans_restored /tmp/dans-restore.dump
+compose exec -T postgres rm -f /tmp/dans-restore.dump
+compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored \
+	--set=database_name=dans_restored --set=schema_name=public --set=runtime_role=dans_runtime \
+	--file=/dans/runtime.sql >/dev/null
+restored_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$snapshot_sql")
+[ "$restored_snapshot" = "$source_snapshot" ] || fail 'restored identity, authority, or audit state differs from backup'
+restored_preserved=$(preserved_state dans_restored)
+[ "$restored_preserved" = "$source_preserved" ] || fail 'restored identity, authority, or audit state differs from backup'
+restored_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$token_sql")
+[ "$restored_tokens" = "$source_tokens" ] || fail 'restored credentials differ from backup'
+preexisting_finalizations=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
+[ "$preexisting_finalizations" -eq 0 ] || fail 'restored fixture already contains a finalization event'
+historical_audit_id=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT id FROM audit_events ORDER BY occurred_at, id LIMIT 1')
+preserved_before=$restored_preserved
 
 if restore_result=$(compose run --rm --no-deps -T \
 	-e DANS_DATABASE_URL='postgres://dans_runtime:dans-runtime@postgres/dans_restored?sslmode=disable' \
@@ -523,7 +664,7 @@ replacement_token=$(printf '%s' "$restore_result" | jq -er '.secret')
 unset restore_result
 active_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL')
 [ "$active_tokens" -eq 1 ] || fail 'restore finalization did not leave exactly one active credential'
-preserved_after=$(preserved_state)
+preserved_after=$(preserved_state dans_restored)
 [ "$preserved_after" = "$preserved_before" ] || fail 'restore finalization changed historical identity, authorization, or audit state'
 finalization_events=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
 [ "$finalization_events" -eq 1 ] || fail 'restore finalization did not append exactly one audit event'
@@ -545,8 +686,14 @@ restored_delegation=$(cli dans-restored "$replacement_token" delegations get "$d
 printf '%s' "$restored_delegation" | jq -e --arg id "$direct_delegation_id" '.id == $id' >/dev/null || fail 'restored delegation is unavailable through the public API'
 restored_audit=$(cli dans-restored "$replacement_token" audit export)
 printf '%s' "$restored_audit" | jq -se --arg id "$historical_audit_id" '[.[] | select(.id == $id)] | length == 1' >/dev/null || fail 'historical audit event is unavailable through the public API'
+restored_zone=$(cli dans-restored "$replacement_token" zones get "$forward_zone_id")
+printf '%s' "$restored_zone" | jq -e --arg id "$forward_zone_id" '.id == $id' >/dev/null || fail 'restored zone is unavailable through the public API'
+restored_change='{"rrsets":[{"changetype":"REPLACE","name":"host.shared.example.test.","type":"A","ttl":180,"records":[{"content":"192.0.2.48"}]}]}'
+cli_data "$restored_change" dans-restored "$replacement_token" rrsets apply "$forward_zone_id" >/dev/null
+[ "$(dns_values "$restored_dns_port" host.shared.example.test. A)" = 192.0.2.48 ] || fail 'restored DANS write did not reach restored DNS'
+[ "$(dns_values "$dns_port" host.shared.example.test. A)" = "$source_forward" ] || fail 'restored DANS write changed source DNS'
 
-compose --profile restore logs --no-color dans-a dans-b dans-restored >"$work/runtime.log"
+compose --profile restore logs --no-color dans-a dans-b dans-restored powerdns-restored >"$work/runtime.log"
 for secret in "$operator_token" "$direct_token" "$group_token" "$replacement_token" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
 	if grep -Fq "$secret" "$work/runtime.log"; then
 		fail 'runtime logs exposed a credential'

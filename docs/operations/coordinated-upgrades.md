@@ -6,11 +6,11 @@ after a migration.
 
 ## Upgrade
 
-1. Create a PostgreSQL backup and verify that it can be restored.
-2. Remove every DANS instance from service. Each instance must enter drain mode,
+1. Remove every DANS instance from service. Each instance must enter drain mode,
    return `503` from `/readyz`, stop accepting new work, and finish or terminate
    in-flight work within its configured drain deadline.
-3. Stop every old-version instance.
+2. Stop every old-version instance.
+3. Quiesce any other permitted PowerDNS writers, create a paired PostgreSQL and backend-specific PowerDNS backup, and verify that both can be restored. The stores have no shared atomic snapshot.
 4. Run the target binary's forward-only `db migrate` command with the DDL
    database role. API runtime credentials are intentionally insufficient. Reapply
    `internal/database/privileges/runtime.sql` with explicit role/schema/database
@@ -23,7 +23,9 @@ after a migration.
    storage, a finalized installation, and a compatible authenticated PowerDNS
    upstream.
 
-Authoritative DNS continues serving while the DANS management plane is drained.
+Authoritative DNS can continue serving during DANS-only drain and migration;
+the chosen PowerDNS backend's backup or restore procedure may have a separate
+availability impact.
 
 ## Rollback and recovery
 
@@ -34,11 +36,11 @@ and remains unready because its expected migration ledger differs.
 To return to an older release after migration:
 
 1. Stop all DANS instances.
-2. Restore the verified backup created for that older release into an isolated database and reapply runtime grants. Keep every instance for that database stopped.
+2. Restore the verified pair created for that older release into an isolated database and a separate authoritative PowerDNS instance, then reapply runtime grants. Keep every DANS instance for those stores stopped. Compare required zones, metadata, keys, and representative forward/PTR answers with the captured source inventory; fail closed on a mismatch. This is a deployment-specific sample, not proof of an atomic snapshot.
 3. Run that release's `restore finalize --confirm` maintenance command. This revokes every
    token restored from the backup and emits one replacement enabled-operator
    token exactly once.
-4. Start only the matching older binary and verify readiness before reopening
+4. Point DANS only at the restored PowerDNS instance, start only the matching older binary, and verify readiness and an authorized isolated DNS write before reopening
    management traffic.
 
 All instances must remain stopped or drained between steps 1 and 4. The

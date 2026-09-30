@@ -1439,10 +1439,11 @@ launch_supervised() {
 		(umask 077 && : >"$launch_marker.ready") || exit 125
 		while [ ! -e "$launch_marker.go" ]; do
 			[ ! -e "$launch_marker.cancel" ] || exit 125
-			sleep 1
+			sleep 0.1
 		done
 		"$@" 2>"$launch_marker.stderr.pipe"
 		supervisor_status=$?
+		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=child-exited" >&5
 		exec 8>&-
 			(
 				watchdog_sleep_pid=
@@ -1481,13 +1482,17 @@ launch_supervised() {
 		supervisor_watchdog_pid=$!
 		wait "$lease_reader_pid" 2>/dev/null || true
 		wait "$stderr_forward_pid" 2>/dev/null || true
+		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=streams-drained" >&5
 		stop_supervisor_watchdog
+		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=watchdog-stopped" >&5
 		supervisor_watchdog_pid=
 		stderr_forward_pid=
 		[ ! -e "$launch_marker.escaped" ] || supervisor_status=125
 		(umask 077 && printf "%s\\n" "$supervisor_status" >"$launch_marker.status" &&
 			: >"$launch_marker.finished") || exit 125
+		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=finished" >&5
 		read -r supervisor_release <"$launch_marker.wait" || exit 125
+		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=released" >&5
 		exit "$supervisor_status"
 	' dans-operation-supervisor "$running_launch_marker" "$running_launch_capture_stderr" "$@" <&9 &
 	running_pid=$!
@@ -1613,11 +1618,13 @@ compose() {
 	set +m
 	launching=0
 	[ "$pending_signal" -eq 0 ] || forward_signal 143
+	[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf '%s\n' 'dev stack contract: caller=wait-start' >&5
 	if wait_supervised; then
 		rc=0
 	else
 		rc=$?
 	fi
+	[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf '%s\n' 'dev stack contract: caller=wait-done' >&5
 	if ! drain_running_processes; then
 		printf '%s\n' 'dev stack: Docker operation left an untrusted process behind' >&2
 		mark_operation_uncertain
@@ -1628,12 +1635,14 @@ compose() {
 		running_records=
 		return 125
 	fi
+	[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf '%s\n' 'dev stack contract: caller=processes-drained' >&5
 	release_supervised_launch || {
 		printf '%s\n' 'dev stack: Docker operation supervisor could not be released' >&2
 		mark_operation_uncertain
 		cancel_supervised_launch
 		return 125
 	}
+	[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf '%s\n' 'dev stack contract: caller=release-done' >&5
 	[ "$rc" -ge 128 ] && mark_operation_uncertain
 	clear_supervised_launch
 	running_pid=

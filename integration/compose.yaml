@@ -19,6 +19,18 @@ services:
       - "127.0.0.1:${POWERDNS_PORT:?}:53/tcp"
     networks: [control, ingress]
 
+  powerdns-restored:
+    image: powerdns/pdns-auth-51:5.1.3
+    profiles: [restore]
+    environment:
+      PDNS_AUTH_API_KEY: dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    volumes:
+      - powerdns_restored:/var/lib/powerdns
+    ports:
+      - "127.0.0.1:${POWERDNS_RESTORED_PORT:?}:53/udp"
+      - "127.0.0.1:${POWERDNS_RESTORED_PORT:?}:53/tcp"
+    networks: [control, ingress]
+
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     networks: [control]
@@ -73,6 +85,7 @@ services:
     environment:
       <<: *dans-environment
       DANS_DATABASE_URL: postgres://dans_runtime:dans-runtime@postgres/dans_restored?sslmode=disable
+      DANS_POWERDNS_URL: http://powerdns-restored:8081
     ports:
       - "127.0.0.1:${DANS_RESTORED_PORT:?}:8080"
 
@@ -90,3 +103,6 @@ networks:
     internal: true
   ingress:
     driver: bridge
+
+volumes:
+  powerdns_restored:
