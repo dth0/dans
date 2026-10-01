@@ -17,7 +17,7 @@ backup=SYNTHETIC_BACKUP_BYTES_DO_NOT_PUBLISH
 diagnostic=SYNTHETIC_RESTORE_DIAGNOSTIC_DO_NOT_PUBLISH
 
 case "${2:-}" in
-	fixture-fail | fixture-early | fixture-invalid | fixture-restore-fail | fixture-success)
+	fixture-fail | fixture-early | fixture-invalid | fixture-restore-fail | fixture-upgrade-fail | fixture-rollback-fail | fixture-success)
 		printf '%s\n' "$secret $path $identifier $backup $diagnostic"
 		printf '%s\n' "$secret $path $identifier $backup $diagnostic" >&2
 		printf '%s\n' "$secret $path $identifier $backup $diagnostic" >"$DANS_QA_LOG_DIR/compose.log"
@@ -34,6 +34,10 @@ case "${2:-}" in
 			fixture-restore-fail)
 				printf '%s\n' restore >"$DANS_QA_PHASE_FILE"
 				exit 31
+				;;
+			fixture-upgrade-fail | fixture-rollback-fail)
+				printf '%s\n' "${2#fixture-}" | cut -d- -f1 >"$DANS_QA_PHASE_FILE"
+				exit 37
 				;;
 			fixture-success) exit 0 ;;
 		esac
@@ -82,5 +86,7 @@ run_case fail 17 exercise postgres:16.14 pg16
 run_case early 23 unknown postgres:18.4 pg18
 run_case invalid 29 unknown postgres:16.14 pg16
 run_case restore-fail 31 restore postgres:18.4 pg18
+run_case upgrade-fail 37 upgrade postgres:16.14 pg16
+run_case rollback-fail 37 rollback postgres:18.4 pg18
 run_case success 0 unknown postgres:16.14 pg16
 printf '%s\n' 'integration CI contract: ok'

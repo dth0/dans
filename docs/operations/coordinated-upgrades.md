@@ -27,6 +27,29 @@ Authoritative DNS can continue serving during DANS-only drain and migration;
 the chosen PowerDNS backend's backup or restore procedure may have a separate
 availability impact.
 
+## Exercised upgrade and rollback
+
+The required PostgreSQL 16 and 18 integration legs build historical revision
+`c59045c51d0e5162400de1e64334ff4ef563ee45` with its original one-migration schema,
+populate policy and DNS through that executable, and capture a quiesced backup
+pair. The target binary applies the browser-session and browse-index migrations
+and its runtime grants. The gate compares preserved policy, audit, and token
+state, checks authoritative answers, and exercises allowed and denied delegated
+writes across both target instances.
+
+The target must reject the old schema before migration, and the historical
+binary must reject the upgraded schema. Rollback restores the pre-upgrade pair
+into isolated stores, passes authoritative preflight, and finalizes with the
+historical executable before starting that matching version. The gate checks
+old-token rejection, preserved history, removal of a post-backup DNS change,
+and a write that reaches only restored DNS. It then separately rehearses recovery
+of the current version.
+
+Run `make integration` from a checkout with full Git history to reproduce both
+legs. This certifies the fixed schema transition exercised by the fixture;
+deployment-specific version pairs, backup backends, and availability plans still
+require verification. Raw diagnostics and backups remain private.
+
 ## Rollback and recovery
 
 Before applying a migration, rollback may restart the previous binary. After a

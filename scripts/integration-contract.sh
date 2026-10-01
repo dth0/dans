@@ -20,6 +20,20 @@ for service in postgres powerdns powerdns-restored toxiproxy dans-a dans-b dans-
 	grep -Eq "^  $service:" "$compose" || fail "compose service $service is missing"
 done
 
+grep -Fq 'previous_revision=c59045c51d0e5162400de1e64334ff4ef563ee45' "$harness" || fail 'the historical schema-transition revision is not pinned'
+grep -Fq 'archive --output="$work/previous.tar" "$previous_revision"' "$harness" || fail 'the older build does not use its original source'
+grep -Fq 'fetch-depth: 0' "$workflow" || fail 'CI omits the historical build source'
+grep -Fq 'stop_management() {' "$harness" || fail 'upgrade does not verify source shutdown'
+grep -Fq 'capture_backup_pair() {' "$harness" || fail 'upgrade and recovery do not share paired backups'
+grep -Fq 'restore_backup_pair() {' "$harness" || fail 'rollback and recovery do not share restored-state checks'
+grep -Fq 'finalize_restored_pair() {' "$harness" || fail 'rollback and recovery do not share offline finalization checks'
+grep -Fq 'target before migration' "$harness" || fail 'the target is not rejected against the historical schema'
+grep -Fq 'older binary after migration' "$harness" || fail 'in-place binary downgrade is not rejected'
+grep -Fq 'upgrade changed historical policy or audit data' "$harness" || fail 'upgrade does not verify historical data preservation'
+grep -Fq 'upgrade changed existing credentials' "$harness" || fail 'upgrade does not verify credential preservation'
+grep -Fq 'mark_phase rollback' "$harness" || fail 'paired rollback is not exercised'
+grep -Fq '>>"$work/runtime.log"' "$harness" || fail 'replaced containers are omitted from the private credential-log scan'
+
 grep -Fq 'postgres:16.14' "$harness" || fail "PostgreSQL 16.14 is not pinned"
 grep -Fq 'postgres:18.4' "$harness" || fail "PostgreSQL 18.4 is not pinned"
 grep -Fq 'powerdns/pdns-auth-51:5.1.3' "$compose" || fail "PowerDNS 5.1.3 is not pinned"

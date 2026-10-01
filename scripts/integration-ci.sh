@@ -39,7 +39,7 @@ phase=unknown
 if [ -f "$DANS_QA_PHASE_FILE" ]; then
 	IFS= read -r candidate 2>/dev/null <"$DANS_QA_PHASE_FILE" || candidate=
 	case "$candidate" in
-		setup | services | measurement | exercise | restore) phase=$candidate ;;
+		setup | services | measurement | exercise | upgrade | rollback | restore) phase=$candidate ;;
 	esac
 fi
 

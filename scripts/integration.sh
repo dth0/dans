@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compose_file=$root/integration/compose.yaml
@@ -19,7 +20,7 @@ case "$postgres_image" in
 		;;
 esac
 
-for command in curl dig docker jq mktemp; do
+for command in curl dig docker git jq mktemp tar; do
 	command -v "$command" >/dev/null 2>&1 || {
 		printf '%s\n' "integration: missing required command: $command" >&2
 		exit 2
@@ -33,6 +34,9 @@ chmod 700 "$work"
 log_dir=${DANS_QA_LOG_DIR:-$work/logs}
 export POSTGRES_IMAGE=$postgres_image
 export DANS_IMAGE=dans-integration:$project
+target_image=$DANS_IMAGE
+previous_revision=c59045c51d0e5162400de1e64334ff4ef563ee45
+previous_image=dans-integration-previous:$project
 port_base=${DANS_QA_PORT_BASE:-$(( 20000 + ($$ % 20000) ))}
 export DANS_A_PORT=${DANS_A_PORT:-$port_base}
 export DANS_B_PORT=${DANS_B_PORT:-$(( port_base + 1 ))}
@@ -70,7 +74,7 @@ cleanup() {
 	fi
 	if [ "${DANS_QA_KEEP:-0}" != 1 ]; then
 		compose --profile faults --profile tools --profile restore down --volumes --remove-orphans >/dev/null 2>&1 || true
-		docker image rm "$DANS_IMAGE" >/dev/null 2>&1 || true
+		docker image rm "$target_image" "$previous_image" >/dev/null 2>&1 || true
 	fi
 	rm -rf "$work/powerdns"
 	if [ -z "${DANS_QA_LOG_DIR:-}" ]; then
@@ -144,11 +148,11 @@ cli_data() {
 }
 
 pdns_cli() {
-	compose exec -T \
+	compose run --rm --no-deps -T \
 		-e DANS_ENDPOINT=http://powerdns:8081/api/v1 \
 		-e DANS_API_TOKEN=dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
 		-e DANS_OUTPUT=json \
-		dans-a /usr/local/bin/dans "$@"
+		dans-a "$@"
 }
 
 pdns_cli_data() {
@@ -283,9 +287,157 @@ create_delegation() {
 	cli_data "$body" dans-a "$operator_token" delegations create
 }
 
+preserved_state() {
+	compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d "$1" -c "SELECT md5(jsonb_build_object(
+		'identities', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM identities t),
+		'groups', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM groups t),
+		'memberships', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM group_memberships t),
+		'bindings', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM zone_bindings t),
+		'delegations', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegations t),
+		'selectors', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_selectors t),
+		'record_types', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_record_types t),
+		'change_kinds', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_change_kinds t),
+		'audit', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM audit_events t WHERE action <> 'restore.finalize')
+	)::text)"
+}
+
+stop_management() {
+	compose stop --timeout 10 dans-a dans-b >/dev/null
+	management_containers=$(compose ps --quiet dans-a dans-b) || fail 'could not verify source shutdown'
+	[ -z "$management_containers" ] || fail 'source instance remains running'
+	for service in dans-a dans-b; do
+		container=$(compose ps --all --quiet "$service")
+		[ -n "$container" ] || fail 'source instance is missing'
+		shutdown_status=$(docker inspect --format '{{.State.ExitCode}}' "$container")
+		[ "$shutdown_status" != 137 ] || fail 'source shutdown required a forced kill'
+	done
+	capture_runtime_logs
+}
+
+capture_runtime_logs() {
+	compose --profile restore logs --no-color dans-a dans-b dans-restored powerdns-restored >>"$work/runtime.log"
+}
+
+assert_incompatible() {
+	compatibility_label=$1
+	wait_for "$compatibility_label readiness A" http_is 503 "$a_root/readyz"
+	wait_for "$compatibility_label readiness B" http_is 503 "$b_root/readyz"
+	assert_http 503 "$a_root/api/v1/servers/localhost/zones" -H "X-API-Key: $operator_token"
+	assert_http 503 "$b_root/api/v1/servers/localhost/zones" -H "X-API-Key: $direct_token"
+}
+
+capture_backup_pair() {
+	stop_management
+	source_zones_json=$(pdns_cli zones list)
+	source_zone_ids=$(printf '%s' "$source_zones_json" | jq -c '[.[].id] | sort')
+	printf '%s' "$source_zones_json" | jq -e --arg forward "$forward_zone_id" --arg reverse "$reverse_zone_id" \
+		'any(.[]; .id == $forward) and any(.[]; .id == $reverse)' >/dev/null || fail 'source PowerDNS zones are incomplete'
+	source_metadata=$(compose exec -T powerdns pdnsutil metadata get example.test. ALLOW-AXFR-FROM)
+	printf '%s' "$source_metadata" | grep -Fq '192.0.2.0/24' || fail 'source PowerDNS metadata is incomplete'
+	source_forward=$(dns_values "$dns_port" host.shared.example.test. A)
+	[ "$source_forward" = "$1" ] || fail 'source forward DNS fixture is incomplete'
+	source_ptr=$(dns_values "$dns_port" 10.2.0.192.in-addr.arpa. PTR)
+	[ "$source_ptr" = host.shared.example.test. ] || fail 'source PTR DNS fixture is incomplete'
+	snapshot_sql='SELECT installation_id, (SELECT count(*) FROM identities), (SELECT count(*) FROM groups), (SELECT count(*) FROM delegations), (SELECT count(*) FROM audit_events) FROM installation_metadata'
+	source_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$snapshot_sql")
+	[ -n "$source_snapshot" ] || fail 'source database snapshot is empty'
+	source_populated=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c 'SELECT EXISTS(SELECT 1 FROM identities) AND EXISTS(SELECT 1 FROM delegations) AND EXISTS(SELECT 1 FROM audit_events)')
+	[ "$source_populated" = t ] || fail 'source database lacks restore fixtures'
+	source_preserved=$(preserved_state dans)
+	token_sql="SELECT md5(COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)), '[]'::jsonb)::text) FROM api_tokens t"
+	source_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$token_sql")
+	compose exec -T postgres sh -c 'umask 077; pg_dump --format=custom -U dans_ddl -d dans --file=/tmp/dans-restore.dump'
+	compose exec -T postgres test -s /tmp/dans-restore.dump || fail 'database backup is empty'
+	compose stop powerdns >/dev/null
+	source_powerdns_container=$(compose ps --all --quiet powerdns)
+	[ -n "$source_powerdns_container" ] || fail 'source PowerDNS container is unavailable'
+	rm -rf "$work/powerdns"
+	mkdir -m 700 "$work/powerdns"
+	docker cp "$source_powerdns_container:/var/lib/powerdns/." "$work/powerdns/" >/dev/null
+	chmod 600 "$work/powerdns/"*
+	[ -s "$work/powerdns/pdns.sqlite3" ] || fail 'PowerDNS backup is empty'
+	compose start powerdns >/dev/null
+}
+
+restore_backup_pair() {
+	compose --profile restore create powerdns-restored >/dev/null
+	seed_restored_powerdns
+	compose --profile restore start powerdns-restored >/dev/null
+	restored_dns_port=$(compose --profile restore port --protocol udp powerdns-restored 53 | awk -F: 'END { print $NF }')
+	wait_for 'restored PowerDNS startup' pdns_cli_restored zones list
+	assert_recovery_preflight || exit 1
+	compose exec -T postgres createdb -U dans_ddl -O dans_ddl dans_restored
+	compose exec -T postgres pg_restore --exit-on-error --no-owner --no-acl -U dans_ddl -d dans_restored /tmp/dans-restore.dump
+	compose exec -T postgres rm -f /tmp/dans-restore.dump
+	compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored \
+		--set=database_name=dans_restored --set=schema_name=public --set=runtime_role=dans_runtime \
+		--file=- <"$1" >/dev/null
+	restored_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$snapshot_sql")
+	[ "$restored_snapshot" = "$source_snapshot" ] || fail 'restored identity, authority, or audit state differs from backup'
+	restored_preserved=$(preserved_state dans_restored)
+	[ "$restored_preserved" = "$source_preserved" ] || fail 'restored identity, authority, or audit state differs from backup'
+	restored_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$token_sql")
+	[ "$restored_tokens" = "$source_tokens" ] || fail 'restored credentials differ from backup'
+}
+
+finalize_restored_pair() {
+	preexisting_finalizations=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
+	[ "$preexisting_finalizations" -eq 0 ] || fail 'restored fixture already contains a finalization event'
+	historical_audit_id=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT id FROM audit_events ORDER BY occurred_at, id LIMIT 1')
+	preserved_before=$restored_preserved
+
+	if restore_result=$(compose run --rm --no-deps -T \
+		-e DANS_DATABASE_URL='postgres://dans_runtime:dans-runtime@postgres/dans_restored?sslmode=disable' \
+		-e DANS_OUTPUT=json dans-a restore finalize --handle operator --token-label restored --confirm 2>"$work/restore-finalize.err"); then
+		:
+	else
+		fail 'restore finalization failed'
+	fi
+	operator_id=$(printf '%s' "$bootstrap" | jq -er '.identity_id')
+	restored_operator_id=$(printf '%s' "$restore_result" | jq -er '.identity_id')
+	[ "$restored_operator_id" = "$operator_id" ] || fail 'restore finalization changed operator identity'
+	replacement_token=$(printf '%s' "$restore_result" | jq -er '.secret')
+	unset restore_result
+	active_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL')
+	[ "$active_tokens" -eq 1 ] || fail 'restore finalization did not leave exactly one active credential'
+	preserved_after=$(preserved_state dans_restored)
+	[ "$preserved_after" = "$preserved_before" ] || fail 'restore finalization changed historical identity, authorization, or audit state'
+	finalization_events=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
+	[ "$finalization_events" -eq 1 ] || fail 'restore finalization did not append exactly one audit event'
+
+	compose --profile restore up --detach dans-restored >/dev/null
+	restored_port=$(compose --profile restore port dans-restored 8080 | awk -F: 'END { print $NF }')
+	restored_root=http://127.0.0.1:$restored_port
+	wait_for 'restored DANS readiness' http_is 200 "$restored_root/readyz"
+	restored_me=$(cli dans-restored "$replacement_token" me get)
+	printf '%s' "$restored_me" | jq -e --arg id "$operator_id" '.id == $id and .enabled == true and .operator == true' >/dev/null || fail 'replacement credential lacks the original operator identity'
+	for token in "$operator_token" "$direct_token" "$group_token"; do
+		expect_cli_error 'restored credential' '401 Unauthorized' dans-restored "$token" me get
+	done
+	restored_identity=$(cli dans-restored "$replacement_token" identities get "$direct_id")
+	printf '%s' "$restored_identity" | jq -e --arg id "$direct_id" '.id == $id' >/dev/null || fail 'restored identity is unavailable through the public API'
+	restored_group=$(cli dans-restored "$replacement_token" groups get "$group_id")
+	printf '%s' "$restored_group" | jq -e --arg id "$group_id" '.id == $id' >/dev/null || fail 'restored group is unavailable through the public API'
+	restored_delegation=$(cli dans-restored "$replacement_token" delegations get "$direct_delegation_id")
+	printf '%s' "$restored_delegation" | jq -e --arg id "$direct_delegation_id" '.id == $id' >/dev/null || fail 'restored delegation is unavailable through the public API'
+	restored_audit=$(cli dans-restored "$replacement_token" audit export)
+	printf '%s' "$restored_audit" | jq -se --arg id "$historical_audit_id" '[.[] | select(.id == $id)] | length == 1' >/dev/null || fail 'historical audit event is unavailable through the public API'
+	restored_zone=$(cli dans-restored "$replacement_token" zones get "$forward_zone_id")
+	printf '%s' "$restored_zone" | jq -e --arg id "$forward_zone_id" '.id == $id' >/dev/null || fail 'restored zone is unavailable through the public API'
+	restored_change='{"rrsets":[{"changetype":"REPLACE","name":"host.shared.example.test.","type":"A","ttl":180,"records":[{"content":"192.0.2.48"}]}]}'
+	cli_data "$restored_change" dans-restored "$replacement_token" rrsets apply "$forward_zone_id" >/dev/null
+	[ "$(dns_values "$restored_dns_port" host.shared.example.test. A)" = 192.0.2.48 ] || fail 'restored DANS write did not reach restored DNS'
+	[ "$(dns_values "$dns_port" host.shared.example.test. A)" = "$source_forward" ] || fail 'restored DANS write changed source DNS'
+}
+
 printf '%s\n' "integration: PostgreSQL $major_minor"
 mark_phase setup
 compose build dans-a
+git -C "$root" cat-file -e "$previous_revision^{commit}" 2>/dev/null || fail 'historical build source is missing; use a checkout with full history'
+git -C "$root" archive --output="$work/previous.tar" "$previous_revision"
+mkdir "$work/previous"
+tar -xf "$work/previous.tar" -C "$work/previous"
+docker build --build-arg VERSION=upgrade-baseline --tag "$previous_image" "$work/previous"
 footprint_container=$(docker container create "$DANS_IMAGE" version)
 rootfs_bytes=$(docker container inspect --size --format '{{.SizeRootFs}}' "$footprint_container")
 "$root/scripts/footprint.sh" image-rootfs-bytes "$rootfs_bytes" 'OCI root filesystem'
@@ -297,12 +449,15 @@ compose up --detach postgres powerdns toxiproxy
 wait_for PostgreSQL compose exec -T postgres pg_isready -h 127.0.0.1 -U dans_ddl -d dans
 toxiproxy create --listen 0.0.0.0:18081 --upstream powerdns:8081 powerdns >/dev/null
 
+export DANS_IMAGE=$previous_image
 compose run --rm --no-deps -T \
 	-e DANS_DATABASE_URL='postgres://dans_ddl:dans-ddl@postgres/dans?sslmode=disable' \
 	-e DANS_OUTPUT=json dans-a db migrate >/dev/null
 compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans \
 	--set=database_name=dans --set=schema_name=public --set=runtime_role=dans_runtime \
-	--file=/dans/runtime.sql >/dev/null
+	--file=- <"$work/previous/internal/database/privileges/runtime.sql" >/dev/null
+previous_schema=$(compose run --rm --no-deps -T -e DANS_OUTPUT=json dans-a db status)
+printf '%s' "$previous_schema" | jq -e '.current_version == 1 and .compatible == true' >/dev/null || fail 'historical migration ledger is incompatible'
 bootstrap=$(compose run --rm --no-deps -T -e DANS_OUTPUT=json dans-a bootstrap \
 	--handle operator --display-name 'Integration operator' --token-label integration)
 operator_token=$(printf '%s' "$bootstrap" | jq -er '.secret')
@@ -315,29 +470,6 @@ a_root=http://127.0.0.1:$a_port
 b_root=http://127.0.0.1:$b_port
 wait_for 'DANS A readiness' http_is 200 "$a_root/readyz"
 wait_for 'DANS B readiness' http_is 200 "$b_root/readyz"
-
-if [ "$(uname -s)" = Linux ]; then
-	for service in dans-a dans-b; do
-		container=$(compose ps --quiet "$service")
-		pid=$(docker inspect --format '{{.State.Pid}}' "$container")
-		[ -r "/proc/$pid/status" ] || fail "local Docker PID $pid for $service is not readable in host /proc"
-		maximum_rss_kib=0
-		for sample in 1 2 3 4 5; do
-			rss_kib=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status")
-			[ -n "$rss_kib" ] || fail "could not measure $service VmRSS sample $sample"
-			"$root/scripts/footprint.sh" rss-kib "$rss_kib" "$service"
-			[ "$rss_kib" -le "$maximum_rss_kib" ] || maximum_rss_kib=$rss_kib
-		done
-		printf '%s\n' "integration: $service ready-idle VmRSS max $maximum_rss_kib KiB across 5 samples"
-	done
-else
-	printf '%s\n' 'integration: ready-idle VmRSS gate runs on native-Linux CI only'
-fi
-
-if [ -n "${DANS_QA_PERFORMANCE_DIR:-}" ]; then
-	mark_phase measurement
-	"$root/scripts/measure-runtime.sh" "$compose_file" "$project" dans-a "$a_root" "$DANS_QA_PERFORMANCE_DIR"
-fi
 
 mark_phase exercise
 forward_zone=$(cli_data '{"name":"example.test.","kind":"Native","nameservers":["ns1.example.test."]}' dans-a "$operator_token" zones create)
@@ -369,6 +501,85 @@ ptr_body=$(printf '{"zone_binding_id":"%s","group_id":"%s","selectors":[{"kind":
 create_delegation "$ptr_body" >/dev/null
 replace_body='{"rrsets":[{"changetype":"REPLACE","name":"host.shared.example.test.","type":"A","ttl":120,"records":[{"content":"192.0.2.10"}],"comments":[{"account":"integration","content":"delegated forward RRset"}]}]}'
 cli_data "$replace_body" dans-a "$direct_token" rrsets apply "$forward_zone_id" >/dev/null
+ptr_replace='{"rrsets":[{"changetype":"REPLACE","name":"10.2.0.192.in-addr.arpa.","type":"PTR","ttl":300,"records":[{"content":"host.shared.example.test."}]}]}'
+cli_data "$ptr_replace" dans-b "$group_token" rrsets apply "$reverse_zone_id" >/dev/null
+metadata='{"kind":"ALLOW-AXFR-FROM","metadata":["192.0.2.0/24"]}'
+assert_http 200 "$a_root/api/v1/servers/localhost/zones/$forward_zone_id/metadata/ALLOW-AXFR-FROM" \
+	-X PUT -H 'Content-Type: application/json' -H "X-API-Key: $operator_token" --data "$metadata"
+
+mark_phase upgrade
+capture_backup_pair 192.0.2.10
+export DANS_IMAGE=$target_image
+compose up --detach --no-build dans-a dans-b >/dev/null
+assert_incompatible 'target before migration'
+stop_management
+compose run --rm --no-deps -T \
+	-e DANS_DATABASE_URL='postgres://dans_ddl:dans-ddl@postgres/dans?sslmode=disable' \
+	-e DANS_OUTPUT=json dans-a db migrate >/dev/null
+compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans \
+	--set=database_name=dans --set=schema_name=public --set=runtime_role=dans_runtime \
+	--file=/dans/runtime.sql >/dev/null
+[ "$(preserved_state dans)" = "$source_preserved" ] || fail 'upgrade changed historical policy or audit data'
+upgraded_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$token_sql")
+[ "$upgraded_tokens" = "$source_tokens" ] || fail 'upgrade changed existing credentials'
+export DANS_IMAGE=$previous_image
+compose up --detach --no-build dans-a dans-b >/dev/null
+assert_incompatible 'older binary after migration'
+stop_management
+export DANS_IMAGE=$target_image
+compose up --detach --no-build dans-a dans-b >/dev/null
+wait_for 'upgraded DANS A readiness' http_is 200 "$a_root/readyz"
+wait_for 'upgraded DANS B readiness' http_is 200 "$b_root/readyz"
+upgraded_schema=$(compose run --rm --no-deps -T -e DANS_OUTPUT=json dans-a db status)
+printf '%s' "$upgraded_schema" | jq -e '.current_version == 3 and .compatible == true' >/dev/null || fail 'target migration ledger is incompatible'
+for token in "$operator_token" "$direct_token" "$group_token"; do
+	cli dans-a "$token" me get >/dev/null
+	cli dans-b "$token" me get >/dev/null
+done
+assert_dns_contains host.shared.example.test. A "$source_forward"
+assert_dns_contains 10.2.0.192.in-addr.arpa. PTR "$source_ptr"
+upgrade_change='{"rrsets":[{"changetype":"REPLACE","name":"upgrade.shared.example.test.","type":"A","ttl":120,"records":[{"content":"192.0.2.49"}]}]}'
+cli_data "$upgrade_change" dans-b "$direct_token" rrsets apply "$forward_zone_id" >/dev/null
+assert_dns_contains upgrade.shared.example.test. A 192.0.2.49
+
+mark_phase rollback
+export DANS_IMAGE=$previous_image
+restore_backup_pair "$work/previous/internal/database/privileges/runtime.sql"
+finalize_restored_pair
+[ -z "$(dns_values "$restored_dns_port" upgrade.shared.example.test. A)" ] || fail 'rollback retained a post-backup DNS change'
+rollback_token=$replacement_token
+compose --profile restore stop --timeout 10 dans-restored powerdns-restored >/dev/null
+capture_runtime_logs
+compose --profile restore rm --force --stop dans-restored powerdns-restored >/dev/null
+compose exec -T postgres dropdb -U dans_ddl dans_restored
+export DANS_IMAGE=$target_image
+cli dans-a "$operator_token" me get >/dev/null
+assert_dns_contains upgrade.shared.example.test. A 192.0.2.49
+
+if [ "$(uname -s)" = Linux ]; then
+	for service in dans-a dans-b; do
+		container=$(compose ps --quiet "$service")
+		pid=$(docker inspect --format '{{.State.Pid}}' "$container")
+		[ -r "/proc/$pid/status" ] || fail "local Docker PID $pid for $service is not readable in host /proc"
+		maximum_rss_kib=0
+		for sample in 1 2 3 4 5; do
+			rss_kib=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status")
+			[ -n "$rss_kib" ] || fail "could not measure $service VmRSS sample $sample"
+			"$root/scripts/footprint.sh" rss-kib "$rss_kib" "$service"
+			[ "$rss_kib" -le "$maximum_rss_kib" ] || maximum_rss_kib=$rss_kib
+		done
+		printf '%s\n' "integration: $service ready-idle VmRSS max $maximum_rss_kib KiB across 5 samples"
+	done
+else
+	printf '%s\n' 'integration: ready-idle VmRSS gate runs on native-Linux CI only'
+fi
+
+if [ -n "${DANS_QA_PERFORMANCE_DIR:-}" ]; then
+	mark_phase measurement
+	"$root/scripts/measure-runtime.sh" "$compose_file" "$project" dans-a "$a_root" "$DANS_QA_PERFORMANCE_DIR"
+fi
+
+mark_phase exercise
 forward_rrset=$(cli dans-b "$direct_token" rrsets get "$forward_zone_id" host.shared.example.test. A)
 printf '%s' "$forward_rrset" | jq -e '.ttl == 120 and .comments[0].content == "delegated forward RRset"' >/dev/null || fail 'forward RRset lost TTL or comments'
 assert_dns_contains host.shared.example.test. A 192.0.2.10
@@ -380,7 +591,6 @@ printf '%s\n' "$assert_dns_absent_value" | grep -Fq 192.0.2.10 && fail 'PRUNE re
 cli dans-b "$direct_token" rrsets delete "$forward_zone_id" host.shared.example.test. A --confirm >/dev/null
 assert_dns_absent host.shared.example.test. A
 
-ptr_replace='{"rrsets":[{"changetype":"REPLACE","name":"10.2.0.192.in-addr.arpa.","type":"PTR","ttl":300,"records":[{"content":"host.shared.example.test."}]}]}'
 cli_data "$ptr_replace" dans-b "$group_token" rrsets apply "$reverse_zone_id" >/dev/null
 ptr_answer=$(dig @127.0.0.1 -p "$dns_port" +time=2 +tries=1 +noall +answer -x 192.0.2.10)
 printf '%s\n' "$ptr_answer" | grep -Fq host.shared.example.test. || fail "PTR query did not return delegated target: $ptr_answer"
@@ -399,7 +609,6 @@ expect_cli_error 'non-operator audit visibility' '403 Forbidden' dans-b "$group_
 assert_http 403 "$a_root/api/v1/servers/localhost/tsigkeys" -H "X-API-Key: $direct_token"
 assert_http 403 "$b_root/api/v1/servers/localhost/config" -H "X-API-Key: $group_token"
 
-metadata='{"kind":"ALLOW-AXFR-FROM","metadata":["192.0.2.0/24"]}'
 assert_http 200 "$a_root/api/v1/servers/localhost/zones/$forward_zone_id/metadata/ALLOW-AXFR-FROM" \
 	-X PUT -H 'Content-Type: application/json' -H "X-API-Key: $operator_token" --data "$metadata"
 assert_http 200 "$b_root/api/v1/servers/localhost/zones/$forward_zone_id/metadata/ALLOW-AXFR-FROM" \
@@ -554,57 +763,10 @@ if grep -Eqi '(^|[[:space:]])(seed|reset|fault|introspect|metrics|pprof|profil|b
 	fail 'production CLI exposes a test-only command'
 fi
 
-preserved_state() {
-	compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d "$1" -c "SELECT md5(jsonb_build_object(
-		'identities', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM identities t),
-		'groups', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM groups t),
-		'memberships', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM group_memberships t),
-		'bindings', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM zone_bindings t),
-		'delegations', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegations t),
-		'selectors', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_selectors t),
-		'record_types', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_record_types t),
-		'change_kinds', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM delegation_change_kinds t),
-		'audit', (SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)) FROM audit_events t WHERE action <> 'restore.finalize')
-	)::text)"
-}
-
 mark_phase restore
 restored_dans_stopped || fail 'restored service started before finalization'
-source_zones_json=$(pdns_cli zones list)
-source_zone_ids=$(printf '%s' "$source_zones_json" | jq -c '[.[].id] | sort')
-printf '%s' "$source_zones_json" | jq -e --arg forward "$forward_zone_id" --arg reverse "$reverse_zone_id" \
-	'any(.[]; .id == $forward) and any(.[]; .id == $reverse)' >/dev/null || fail 'source PowerDNS zones are incomplete'
-source_metadata=$(compose exec -T powerdns pdnsutil metadata get example.test. ALLOW-AXFR-FROM)
-printf '%s' "$source_metadata" | grep -Fq '192.0.2.0/24' || fail 'source PowerDNS metadata is incomplete'
-source_forward=$(dns_values "$dns_port" host.shared.example.test. A)
-[ "$source_forward" = 192.0.2.47 ] || fail 'source forward DNS fixture is incomplete'
-source_ptr=$(dns_values "$dns_port" 10.2.0.192.in-addr.arpa. PTR)
-[ "$source_ptr" = host.shared.example.test. ] || fail 'source PTR DNS fixture is incomplete'
-snapshot_sql='SELECT installation_id, (SELECT count(*) FROM identities), (SELECT count(*) FROM groups), (SELECT count(*) FROM delegations), (SELECT count(*) FROM audit_events) FROM installation_metadata'
-source_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$snapshot_sql")
-[ -n "$source_snapshot" ] || fail 'source database snapshot is empty'
-source_populated=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c 'SELECT EXISTS(SELECT 1 FROM identities) AND EXISTS(SELECT 1 FROM delegations) AND EXISTS(SELECT 1 FROM audit_events)')
-[ "$source_populated" = t ] || fail 'source database lacks restore fixtures'
-compose stop dans-a dans-b >/dev/null
-source_preserved=$(preserved_state dans)
-token_sql="SELECT md5(COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)), '[]'::jsonb)::text) FROM api_tokens t"
-source_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans -c "$token_sql")
-compose exec -T postgres sh -c 'umask 077; pg_dump --format=custom -U dans_ddl -d dans --file=/tmp/dans-restore.dump'
-compose exec -T postgres test -s /tmp/dans-restore.dump || fail 'database backup is empty'
-compose stop powerdns >/dev/null
-source_powerdns_container=$(compose ps --all --quiet powerdns)
-[ -n "$source_powerdns_container" ] || fail 'source PowerDNS container is unavailable'
-mkdir -m 700 "$work/powerdns"
-docker cp "$source_powerdns_container:/var/lib/powerdns/." "$work/powerdns/" >/dev/null
-chmod 600 "$work/powerdns/"*
-[ -s "$work/powerdns/pdns.sqlite3" ] || fail 'PowerDNS backup is empty'
-compose start powerdns >/dev/null
-compose --profile restore create powerdns-restored >/dev/null
-seed_restored_powerdns
-compose --profile restore start powerdns-restored >/dev/null
-restored_dns_port=$(compose --profile restore port --protocol udp powerdns-restored 53 | awk -F: 'END { print $NF }')
-wait_for 'restored PowerDNS startup' pdns_cli_restored zones list
-assert_recovery_preflight || exit 1
+capture_backup_pair 192.0.2.47
+restore_backup_pair "$root/internal/database/privileges/runtime.sql"
 expect_compose_query_rejection failed
 expect_compose_query_rejection running
 (
@@ -633,68 +795,10 @@ seed_restored_powerdns
 compose --profile restore start powerdns-restored >/dev/null
 wait_for 'restored PowerDNS restart' pdns_cli_restored zones list
 assert_recovery_preflight || exit 1
-compose exec -T postgres createdb -U dans_ddl -O dans_ddl dans_restored
-compose exec -T postgres pg_restore --exit-on-error --no-owner --no-acl -U dans_ddl -d dans_restored /tmp/dans-restore.dump
-compose exec -T postgres rm -f /tmp/dans-restore.dump
-compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored \
-	--set=database_name=dans_restored --set=schema_name=public --set=runtime_role=dans_runtime \
-	--file=/dans/runtime.sql >/dev/null
-restored_snapshot=$(compose exec -T postgres psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$snapshot_sql")
-[ "$restored_snapshot" = "$source_snapshot" ] || fail 'restored identity, authority, or audit state differs from backup'
-restored_preserved=$(preserved_state dans_restored)
-[ "$restored_preserved" = "$source_preserved" ] || fail 'restored identity, authority, or audit state differs from backup'
-restored_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "$token_sql")
-[ "$restored_tokens" = "$source_tokens" ] || fail 'restored credentials differ from backup'
-preexisting_finalizations=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
-[ "$preexisting_finalizations" -eq 0 ] || fail 'restored fixture already contains a finalization event'
-historical_audit_id=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT id FROM audit_events ORDER BY occurred_at, id LIMIT 1')
-preserved_before=$restored_preserved
+finalize_restored_pair
 
-if restore_result=$(compose run --rm --no-deps -T \
-	-e DANS_DATABASE_URL='postgres://dans_runtime:dans-runtime@postgres/dans_restored?sslmode=disable' \
-	-e DANS_OUTPUT=json dans-a restore finalize --handle operator --token-label restored --confirm 2>"$work/restore-finalize.err"); then
-	:
-else
-	fail 'restore finalization failed'
-fi
-operator_id=$(printf '%s' "$bootstrap" | jq -er '.identity_id')
-restored_operator_id=$(printf '%s' "$restore_result" | jq -er '.identity_id')
-[ "$restored_operator_id" = "$operator_id" ] || fail 'restore finalization changed operator identity'
-replacement_token=$(printf '%s' "$restore_result" | jq -er '.secret')
-unset restore_result
-active_tokens=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c 'SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL')
-[ "$active_tokens" -eq 1 ] || fail 'restore finalization did not leave exactly one active credential'
-preserved_after=$(preserved_state dans_restored)
-[ "$preserved_after" = "$preserved_before" ] || fail 'restore finalization changed historical identity, authorization, or audit state'
-finalization_events=$(compose exec -T postgres psql -X -A -t -v ON_ERROR_STOP=1 -U dans_ddl -d dans_restored -c "SELECT count(*) FROM audit_events WHERE action = 'restore.finalize'")
-[ "$finalization_events" -eq 1 ] || fail 'restore finalization did not append exactly one audit event'
-
-compose --profile restore up --detach dans-restored >/dev/null
-restored_port=$(compose --profile restore port dans-restored 8080 | awk -F: 'END { print $NF }')
-restored_root=http://127.0.0.1:$restored_port
-wait_for 'restored DANS readiness' http_is 200 "$restored_root/readyz"
-restored_me=$(cli dans-restored "$replacement_token" me get)
-printf '%s' "$restored_me" | jq -e --arg id "$operator_id" '.id == $id and .enabled == true and .operator == true' >/dev/null || fail 'replacement credential lacks the original operator identity'
-for token in "$operator_token" "$direct_token" "$group_token"; do
-	expect_cli_error 'restored credential' '401 Unauthorized' dans-restored "$token" me get
-done
-restored_identity=$(cli dans-restored "$replacement_token" identities get "$direct_id")
-printf '%s' "$restored_identity" | jq -e --arg id "$direct_id" '.id == $id' >/dev/null || fail 'restored identity is unavailable through the public API'
-restored_group=$(cli dans-restored "$replacement_token" groups get "$group_id")
-printf '%s' "$restored_group" | jq -e --arg id "$group_id" '.id == $id' >/dev/null || fail 'restored group is unavailable through the public API'
-restored_delegation=$(cli dans-restored "$replacement_token" delegations get "$direct_delegation_id")
-printf '%s' "$restored_delegation" | jq -e --arg id "$direct_delegation_id" '.id == $id' >/dev/null || fail 'restored delegation is unavailable through the public API'
-restored_audit=$(cli dans-restored "$replacement_token" audit export)
-printf '%s' "$restored_audit" | jq -se --arg id "$historical_audit_id" '[.[] | select(.id == $id)] | length == 1' >/dev/null || fail 'historical audit event is unavailable through the public API'
-restored_zone=$(cli dans-restored "$replacement_token" zones get "$forward_zone_id")
-printf '%s' "$restored_zone" | jq -e --arg id "$forward_zone_id" '.id == $id' >/dev/null || fail 'restored zone is unavailable through the public API'
-restored_change='{"rrsets":[{"changetype":"REPLACE","name":"host.shared.example.test.","type":"A","ttl":180,"records":[{"content":"192.0.2.48"}]}]}'
-cli_data "$restored_change" dans-restored "$replacement_token" rrsets apply "$forward_zone_id" >/dev/null
-[ "$(dns_values "$restored_dns_port" host.shared.example.test. A)" = 192.0.2.48 ] || fail 'restored DANS write did not reach restored DNS'
-[ "$(dns_values "$dns_port" host.shared.example.test. A)" = "$source_forward" ] || fail 'restored DANS write changed source DNS'
-
-compose --profile restore logs --no-color dans-a dans-b dans-restored powerdns-restored >"$work/runtime.log"
-for secret in "$operator_token" "$direct_token" "$group_token" "$replacement_token" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
+capture_runtime_logs
+for secret in "$operator_token" "$direct_token" "$group_token" "$replacement_token" "$rollback_token" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
 	if grep -Fq "$secret" "$work/runtime.log"; then
 		fail 'runtime logs exposed a credential'
 	fi
