@@ -1259,7 +1259,7 @@ clear_supervised_launch() {
 		"$running_launch_marker.status" "$running_launch_marker.finished" \
 		"$running_launch_marker.escaped" "$running_launch_marker.lease-ready" \
 		"$running_launch_marker.stderr" "$running_launch_marker.stderr.pipe" \
-		"$running_launch_marker.watchdog"
+		"$running_launch_marker.watchdog-stop"
 	[ -z "${running_launch_wait:-}" ] || rm -f "$running_launch_wait" "$running_launch_wait.writer"
 	[ -z "${running_launch_lease:-}" ] || rm -f "$running_launch_lease"
 	[ -z "${running_group_baseline_file:-}" ] ||
@@ -1376,37 +1376,12 @@ launch_supervised() {
 		shift 2
 		stderr_forward_pid=
 		supervisor_watchdog_pid=
-		watchdog_process_identity() {
-			watchdog_process_id=$1
-			if [ -r "/proc/$watchdog_process_id/stat" ]; then
-				IFS= read -r watchdog_process_stat <"/proc/$watchdog_process_id/stat" || return 1
-				watchdog_process_stat=${watchdog_process_stat##*) }
-				set -- $watchdog_process_stat
-				[ -n "${20:-}" ] || return 1
-				printf "%s\\n" "${20}"
-				return 0
-			fi
-			watchdog_process_start=$(ps -p "$watchdog_process_id" -o lstart= 2>/dev/null | tr -d "[:space:]")
-			[ -n "$watchdog_process_start" ] || return 1
-			printf "%s\\n" "$watchdog_process_start"
-		}
 		stop_supervisor_watchdog() {
 			if [ -n "${supervisor_watchdog_pid:-}" ]; then
-				watchdog_attempt=0
-				while [ ! -s "$launch_marker.watchdog" ] && [ "$watchdog_attempt" -lt 30 ]; do
-					watchdog_attempt=$((watchdog_attempt + 1))
-					sleep 0.1
-				done
-				watchdog_sleep_pid=$(sed -n "1p" "$launch_marker.watchdog" 2>/dev/null || true)
-				watchdog_sleep_identity=$(sed -n "2p" "$launch_marker.watchdog" 2>/dev/null || true)
-				if [ -n "$watchdog_sleep_pid" ] && [ -n "$watchdog_sleep_identity" ] &&
-					[ "$(watchdog_process_identity "$watchdog_sleep_pid" || true)" = "$watchdog_sleep_identity" ]; then
-					kill -KILL "$watchdog_sleep_pid" 2>/dev/null || true
-				fi
-				kill -TERM "$supervisor_watchdog_pid" 2>/dev/null || true
+				: >"$launch_marker.watchdog-stop" || return 1
 				wait "$supervisor_watchdog_pid" 2>/dev/null || true
 			fi
-			rm -f "$launch_marker.watchdog"
+			rm -f "$launch_marker.watchdog-stop"
 		}
 		supervisor_cleanup() {
 			stop_supervisor_watchdog
@@ -1445,36 +1420,16 @@ launch_supervised() {
 		supervisor_status=$?
 		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=child-exited" >&5
 		exec 8>&-
-			(
-				watchdog_sleep_pid=
-				watchdog_stop() { exit 0; }
-				watchdog_cleanup() {
-					if [ -n "${watchdog_sleep_pid:-}" ]; then
-						watchdog_cleanup_pid=$watchdog_sleep_pid
-						watchdog_cleanup_identity=${watchdog_sleep_identity:-}
-						watchdog_sleep_pid=
-						watchdog_sleep_identity=
-						if [ -n "$watchdog_cleanup_identity" ] &&
-							[ "$(watchdog_process_identity "$watchdog_cleanup_pid" || true)" = "$watchdog_cleanup_identity" ]; then
-							kill -KILL "$watchdog_cleanup_pid" 2>/dev/null || true
-						fi
-						wait "$watchdog_cleanup_pid" 2>/dev/null || true
-					fi
-				}
-				trap watchdog_cleanup EXIT
-				trap watchdog_stop HUP INT TERM
-				sleep 10 &
-				watchdog_sleep_pid=$!
-				watchdog_sleep_identity=$(watchdog_process_identity "$watchdog_sleep_pid" || true)
-				printf "%s\\n%s\\n" "$watchdog_sleep_pid" "$watchdog_sleep_identity" >"$launch_marker.watchdog"
-				if wait "$watchdog_sleep_pid" 2>/dev/null; then
-					watchdog_sleep_pid=
-					watchdog_sleep_identity=
-				else
-					watchdog_sleep_pid=
-					watchdog_sleep_identity=
-					exit 0
-				fi
+		(
+			# Cooperative cancellation avoids signal traps and process-lookup races.
+			trap - EXIT
+			watchdog_attempt=0
+			while [ "$watchdog_attempt" -lt 100 ]; do
+				[ ! -e "$launch_marker.watchdog-stop" ] || exit 0
+				sleep 0.1
+				watchdog_attempt=$((watchdog_attempt + 1))
+			done
+			[ ! -e "$launch_marker.watchdog-stop" ] || exit 0
 			(umask 077 && : >"$launch_marker.escaped") 2>/dev/null || true
 			kill -TERM "$lease_reader_pid" 2>/dev/null || true
 			kill -TERM "$stderr_forward_pid" 2>/dev/null || true
@@ -1483,7 +1438,7 @@ launch_supervised() {
 		wait "$lease_reader_pid" 2>/dev/null || true
 		wait "$stderr_forward_pid" 2>/dev/null || true
 		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=streams-drained" >&5
-		stop_supervisor_watchdog
+		stop_supervisor_watchdog || exit 125
 		[ "${DANS_DEV_TEST_TRACE_SUPERVISOR:-0}" != 1 ] || printf "%s\n" "dev stack contract: supervisor=watchdog-stopped" >&5
 		supervisor_watchdog_pid=
 		stderr_forward_pid=

@@ -30,6 +30,10 @@ docker compose --file deploy/docker/compose.yaml up -d
 
 Use `podman network create --internal ...` and `podman compose --file deploy/docker/compose.yaml up -d` for Podman. Ensure the host secret files are readable by container UID 65532 without making them generally readable. The only published socket is the ingress's TLS port 443; DANS itself joins only private networks.
 
+The stock Caddy executable carries the `NET_BIND_SERVICE` file capability. The ingress drops all other capabilities and retains this one so the executable can start, even though its container listener uses port 8443. DANS retains no Linux capabilities.
+
+Ingress also joins an external-facing bridge so Docker can publish its TLS socket. DANS joins only the internal ingress network and the two private dependency networks.
+
 ## Kubernetes
 
 The manifest assumes:
@@ -55,3 +59,18 @@ kubectl apply --filename deploy/kubernetes/dans.yaml
 ```
 
 The pod runs as UID/GID 65532 with a read-only filesystem and no Linux capabilities. NetworkPolicy admits API traffic only from the trusted ingress and permits DANS egress only to DNS, PostgreSQL, and PowerDNS. The PowerDNS-side policy allows public authoritative DNS on port 53 but admits its HTTP API only from DANS. Adapt the selectors to the actual ingress and dependency labels before applying the policy.
+
+## Runtime verification
+
+Required CI runs `scripts/deploy-runtime_test.sh postgres:16.14` through the privacy-safe integration entry point. The test layers disposable dependencies and loopback test ports over the Docker example, keeping its Caddyfile, service security settings, and file-secret configuration. It validates TLS with an explicitly trusted synthetic certificate, readiness, embedded console delivery, secure cookie authentication, a DNS write, cross-origin denial, logout, and private listener isolation. An injected failure also verifies cleanup.
+
+To run the same check locally, install Docker Compose 2.24.4 or newer, curl, dig, jq, and OpenSSL:
+
+```sh
+umask 077
+evidence=$(mktemp -d)
+DANS_QA_LOG_DIR="$evidence/raw" DANS_QA_SUMMARY_DIR="$evidence/summary" \
+  scripts/integration-ci.sh scripts/deploy-runtime_test.sh postgres:16.14
+```
+
+Raw evidence stays in the private directory; only a fixed phase summary is suitable for publication. The test removes its own containers, networks, volumes, image tag, and generated secret files. Its synthetic secret files sit beneath a mode-0700 host directory and are readable inside their individual container mounts; use appropriate restricted ownership or ACLs when provisioning production secrets. The runtime gate covers Docker Compose and API session transport. Kubernetes configuration is rendered by `scripts/deploy-smoke.sh`; cluster NetworkPolicy enforcement, Podman behavior, and browser rendering are separate verification concerns.

@@ -363,17 +363,6 @@ for arg do
 	case "$arg" in
 		[0-9]*) pid=$arg ;;
 		lstart=)
-		if [ -n "${DEV_TEST_WATCHDOG_PS_MISS_FILE:-}" ] &&
-			[ ! -e "$DEV_TEST_WATCHDOG_PS_MISS_FILE" ]; then
-			probe=0
-			while [ "$probe" -lt 4 ]; do
-				case "$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)" in
-					*'sleep 10') : >"$DEV_TEST_WATCHDOG_PS_MISS_FILE"; exit 1 ;;
-				esac
-				probe=$((probe + 1))
-				sleep 0.05
-			done
-		fi
 			[ "${DEV_TEST_FAKE_IDENTITIES:-0}" = 1 ] || exec /bin/ps "$@"
 			printf 'pid-%s\n' "$pid"
 			exit 0
@@ -657,12 +646,7 @@ printf '%s\n' 'dev stack contract: phase=launcher-drain' >&2
 launcher_child_file=$work/launcher-child
 rm -f "$launcher_child_file"
 launcher_parent_group=$(process_group_id "$$" || true)
-watchdog_ps_miss_file=
-if [ "$(uname -s)" = Darwin ] && [ "$DEV_TEST_FAKE_IDENTITIES" = 0 ]; then
-	watchdog_ps_miss_file=$work/watchdog-ps-miss
-fi
 if DEV_TEST_MODE=launcher-leaves-child \
-	DEV_TEST_WATCHDOG_PS_MISS_FILE=$watchdog_ps_miss_file \
 	DEV_TEST_LAUNCHER_CHILD_PID_FILE=$launcher_child_file \
 	DEV_TEST_RECOVER_COUNT_FILE=$work/recover-count \
 	DEV_TEST_ME_COUNT_FILE=$work/me-count \
@@ -672,10 +656,6 @@ if DEV_TEST_MODE=launcher-leaves-child \
 else
 	launcher_child_status=$?
 fi
-[ -z "$watchdog_ps_miss_file" ] || [ -e "$watchdog_ps_miss_file" ] || {
-	printf '%s\n' 'dev stack behavior: watchdog identity fault was not exercised' >&2
-	exit 1
-}
 grep -Fq 'supervisor watchdog detected an escaped process' "$work/launcher-child.stderr" || {
 	printf '%s\n' 'dev stack behavior: launcher watchdog did not identify escaped process' >&2
 	exit 1

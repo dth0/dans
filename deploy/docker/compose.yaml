@@ -28,6 +28,8 @@ services:
     read_only: true
     restart: unless-stopped
     cap_drop: ["ALL"]
+    # The stock Caddy binary carries this file capability and requires it at exec.
+    cap_add: ["NET_BIND_SERVICE"]
     security_opt: ["no-new-privileges:true"]
     ports:
       - "443:8443"
@@ -42,6 +44,7 @@ services:
       - /data
     networks:
       - ingress-private
+      - ingress-public
 
 configs:
   caddyfile:
@@ -58,6 +61,8 @@ secrets:
     file: ${DANS_TLS_KEY_FILE:?set DANS_TLS_KEY_FILE}
 
 networks:
+  ingress-public:
+    driver: bridge
   ingress-private:
     internal: true
   database-private:

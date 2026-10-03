@@ -59,6 +59,58 @@ jobs:
       - run: go test -race ./...
       - run: go vet ./...
 
+  deployment:
+    name: TLS deployment runtime
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deployment probe tools
+        run: |
+          sudo apt-get update >/dev/null 2>&1
+          sudo apt-get install -y curl dnsutils jq openssl >/dev/null 2>&1
+      - name: Verify failure containment and cleanup
+        env:
+          DANS_QA_LOG_DIR: ${{ runner.temp }}/dans-deployment-failure/raw
+          DANS_QA_SUMMARY_DIR: ${{ runner.temp }}/dans-deployment-failure/summary
+          DANS_DEPLOY_TEST_INJECT_FAILURE: after-ready
+        run: |
+          if scripts/integration-ci.sh scripts/deploy-runtime_test.sh postgres:16.14; then
+            exit 1
+          fi
+          if (
+            set -eu
+            grep -Fxq 'integration: pg16 phase=services outcome=failed status=1' "$DANS_QA_SUMMARY_DIR/summary.txt" || exit 1
+            grep -Fxq 'deployment test: injected failure after readiness' "$DANS_QA_LOG_DIR/run.log" || exit 1
+            project=$(cat "$DANS_QA_LOG_DIR/project") || exit 1
+            containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project") || exit 1
+            volumes=$(docker volume ls -q --filter "label=com.docker.compose.project=$project") || exit 1
+            networks=$(docker network ls -q --filter "label=com.docker.compose.project=$project") || exit 1
+            images=$(docker image ls -q "dans-deploy-test:$project") || exit 1
+            test -z "$containers$volumes$networks$images" || exit 1
+            work_dir=$(cat "$DANS_QA_LOG_DIR/work-dir") || exit 1
+            test ! -e "$work_dir" || exit 1
+          ) >"$DANS_QA_LOG_DIR/cleanup-check.log" 2>&1; then
+            printf '%s\n' 'deployment cleanup: ok'
+          else
+            printf '%s\n' 'deployment cleanup: failed' >&2
+            exit 1
+          fi
+      - name: Run TLS deployment rehearsal
+        id: deployment_runtime
+        env:
+          DANS_QA_LOG_DIR: ${{ runner.temp }}/dans-deployment/raw
+          DANS_QA_SUMMARY_DIR: ${{ runner.temp }}/dans-deployment/summary
+        run: scripts/integration-ci.sh scripts/deploy-runtime_test.sh postgres:16.14
+      - name: Upload safe deployment summary
+        if: failure() && steps.deployment_runtime.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dans-deployment-summary
+          path: ${{ runner.temp }}/dans-deployment/summary
+          if-no-files-found: ignore
+
   dev-stack:
     name: development stack lifecycle
     needs: unit
@@ -156,16 +208,27 @@ jobs:
 
   dev-stack-shell:
     name: development shell contract (macOS)
-    needs: unit
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - name: Verify lock primitive
         run: command -v mkdir >/dev/null 2>&1
+      - name: Verify supervisor cancellation
+        timeout-minutes: 1
+        run: python3 scripts/dev-supervisor_test.py
       - name: Verify mocked stack behavior
+        timeout-minutes: 10
         run: scripts/dev-stack_test.sh
+
+  dev-host-shell:
+    name: development host probes (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
       - name: Verify mocked host probes
+        timeout-minutes: 10
         run: scripts/dev-host-smoke_test.sh
 
   integration:
