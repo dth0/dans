@@ -13,6 +13,7 @@ Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow repeats th
 
 ```sh
 sha256sum --check SHA256SUMS
+chmod 0755 ./dans_v1.0.0_linux_amd64
 ./dans_v1.0.0_linux_amd64 version
 ```
 
@@ -37,4 +38,32 @@ scripts/oci-smoke.sh dans-release-smoke linux/arm64 v1.0.0
 
 Release publication does not replace the complete verification baseline in OpenSpec task 12.6; generation, unit, race, static, integration, and contract gates must also pass.
 
-The evidence-backed artifact, startup, ready-idle memory, and representative request-path measurements are recorded in the [performance and resource baseline](../openspec/changes/build-dans-v1/evidence/performance/README.md). CI runs portable and real-PostgreSQL benchmark correctness smoke but deliberately does not hard-gate shared-runner `ns/op` values.
+The evidence-backed artifact, startup, ready-idle memory, and representative request-path measurements are recorded in the [performance and resource baseline](../openspec/changes/archive/2026-08-17-build-dans-v1/evidence/performance/README.md). CI runs portable and real-PostgreSQL benchmark correctness smoke but deliberately does not hard-gate shared-runner `ns/op` values.
+
+## First release checklist
+
+The prepared [v1.0.0 release notes](releases/v1.0.0.md) and [artifact rehearsal](releases/v1.0.0-verification.md) describe the candidate. The rehearsal does not publish a tag, GitHub release, or registry image.
+
+1. Merge the readiness changes and require all CI checks on that exact main commit to pass. Confirm the chosen version has no existing tag or release and review the release notes, supported dependencies, and operations runbooks.
+2. Rehearse with Node.js 24 and the pinned Go toolchain. Keep candidate artifacts and raw logs in private storage:
+
+   ```sh
+   export GOTOOLCHAIN=go1.26.5
+   scripts/release_workflow_test.sh
+   scripts/release_test.sh
+   scripts/release.sh build v1.0.0 dist/v1.0.0
+   scripts/release.sh verify dist/v1.0.0
+   scripts/oci-smoke.sh dans-release-smoke linux/amd64 v1.0.0
+   scripts/oci-smoke.sh dans-release-smoke linux/arm64 v1.0.0
+   ```
+
+3. When the candidate is approved for publication, tag the verified main commit and push that version tag. The release workflow rebuilds from the tagged source, checks both platforms, pushes the versioned and `latest` images, and creates the GitHub release with generated notes.
+4. Apply the reviewed first-release notes to the published release:
+
+   ```sh
+   gh release edit v1.0.0 --notes-file docs/releases/v1.0.0.md
+   ```
+
+5. Download the published executables and checksum manifest into a fresh directory, verify their checksums and `version` output on each target architecture, and pull the versioned image for both platforms. Recheck image platform, UID/GID, `version`, `help`, and `db migrate --help`. Record the published image digest and use that digest when pinning an installation.
+
+Publication remains unverified until those downloaded and pulled artifacts pass. A local build does not establish registry access, release permissions, or the integrity of a later workflow build. If publication fails after pushing an image, inspect the existing tag, release, and package state before retrying; do not replace a version tag or assume nothing was published.

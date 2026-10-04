@@ -8,6 +8,7 @@ These procedures use the released `dans` executable for both API and maintenance
 
    ```sh
    sha256sum --check SHA256SUMS
+   chmod 0755 ./dans_v1.0.0_linux_amd64
    ./dans_v1.0.0_linux_amd64 version
    ```
 

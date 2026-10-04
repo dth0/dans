@@ -1,6 +1,6 @@
 # Web console design
 
-The embedded console supports DNS editing and access management. The first-release checks and DNS capacity measurements are recorded in its [verification note](../openspec/changes/add-web-console/verification.md); the [management verification note](../openspec/changes/complete-management-console/verification.md) records the added workflows and capacity checks.
+The embedded console supports DNS editing and access management. The first-release checks and DNS capacity measurements are recorded in its [verification note](../openspec/changes/archive/2026-09-23-add-web-console/verification.md); the [management verification note](../openspec/changes/archive/2026-09-23-complete-management-console/verification.md) records the added workflows and capacity checks.
 
 ## Product and scope
 
