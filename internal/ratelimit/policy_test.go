@@ -95,6 +95,41 @@ func TestNewBuiltinTableAppliesDefaultsToEveryone(t *testing.T) {
 	}
 }
 
+func TestPolicyNamedOperationsInheritWildcardOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		document string
+		want     Bucket
+	}{
+		{
+			name:     "global defaults",
+			document: `{"defaults":{"operations":{"*":{"refill_per_second":20},"listZones":{"capacity":10}}}}`,
+			want:     Bucket{10, 20},
+		},
+		{
+			name: "identity override",
+			document: `{
+				"defaults":{"operations":{"*":{"refill_per_second":20}}},
+				"identities":{"` + testIdentity + `":{"operations":{"*":{"refill_per_second":30},"listZones":{"capacity":10}}}}
+			}`,
+			want: Bucket{10, 30},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Repeated resolution exercises Go's randomized map iteration order.
+			for attempt := range 256 {
+				table, _, err := ParsePolicy([]byte(test.document), testOperations)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := table.For(testIdentity).OperationBucket("listZones"); got != test.want {
+					t.Fatalf("attempt %d: listZones = %+v, want %+v", attempt, got, test.want)
+				}
+			}
+		})
+	}
+}
+
 func TestParsePolicyRejectsInvalidDocuments(t *testing.T) {
 	cases := map[string]string{
 		"unknown property":          `{"default": {}}`,

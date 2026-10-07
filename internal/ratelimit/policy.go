@@ -293,9 +293,11 @@ func (override Override) apply(base Policy) Policy {
 	if override.Changes != nil {
 		policy.Changes = override.Changes.apply(policy.Changes)
 	}
+	if bucket, ok := override.Operations[DefaultOperationKey]; ok {
+		policy.DefaultOperation = bucket.apply(policy.DefaultOperation)
+	}
 	for operation, bucket := range override.Operations {
 		if operation == DefaultOperationKey {
-			policy.DefaultOperation = bucket.apply(policy.DefaultOperation)
 			continue
 		}
 		policy.Operations[operation] = bucket.apply(policy.OperationBucket(operation))

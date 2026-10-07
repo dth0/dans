@@ -37,6 +37,7 @@ func RateLimit(limiter RateLimiter) Middleware {
 				next.ServeHTTP(w, request)
 				return
 			}
+			AccessMetadataFromContext(request.Context()).SetActorID(actor.IdentityID)
 			meter := ratelimit.Request{IdentityID: actor.IdentityID, Operation: route.OperationID}
 			if route.OperationID == ratelimit.PatchZoneOperation {
 				kinds, err := patchChangeKinds(request)

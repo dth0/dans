@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"time"
@@ -43,6 +44,7 @@ func NewRedisClient(rawURL string, timeout time.Duration) (*RedisClient, error) 
 	if timeout <= 0 {
 		return nil, errors.New("rate limiter: Redis timeout must be positive")
 	}
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 5 * time.Minute}
 	pool := &redis.Pool{
 		MaxIdle:     redisMaxIdle,
 		MaxActive:   redisMaxActive,
@@ -50,11 +52,32 @@ func NewRedisClient(rawURL string, timeout time.Duration) (*RedisClient, error) 
 		// Waiting for a free connection is bounded by the request deadline.
 		Wait: true,
 		DialContext: func(ctx context.Context) (redis.Conn, error) {
-			return redis.DialURLContext(ctx, rawURL,
-				redis.DialConnectTimeout(timeout),
+			var stopCancel func() bool
+			conn, err := redis.DialURLContext(ctx, rawURL,
+				redis.DialContextFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+					conn, err := dialer.DialContext(ctx, network, address)
+					if err != nil {
+						return nil, err
+					}
+					// Redigo's TLS handshake does not observe context cancellation.
+					stopCancel = context.AfterFunc(ctx, func() { _ = conn.Close() })
+					return conn, nil
+				}),
+				redis.DialTLSHandshakeTimeout(timeout),
 				redis.DialReadTimeout(timeout),
 				redis.DialWriteTimeout(timeout),
 			)
+			// A pooled connection must outlive the context that opened it.
+			if stopCancel != nil {
+				stopCancel()
+			}
+			if err := ctx.Err(); err != nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				return nil, err
+			}
+			return conn, err
 		},
 	}
 	return &RedisClient{pool: pool, timeout: timeout}, nil

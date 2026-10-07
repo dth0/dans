@@ -10,7 +10,7 @@ client --TLS--> trusted ingress --> private DANS --> PostgreSQL primary
 
 PostgreSQL and PowerDNS are external dependencies. The examples do not publish the DANS listener or PowerDNS API, and only DANS receives the PowerDNS key. Authoritative DNS on port 53 remains independent of DANS.
 
-Both examples enable per-identity rate limiting and run their own Redis for it. Redis holds only disposable bucket state: it runs without persistence, needs no backup, and may be restarted or flushed at any time, which resets every bucket to full. If Redis is unavailable, DANS admits requests unmetered and logs `rate_limit.fail_open` warnings; readiness does not depend on it. Redis joins only a private network shared with DANS, and DANS authenticates as an ACL user that can run only the bucket script's commands on `dans:rl:*` keys. To run without rate limiting, remove the `DANS_RATE_LIMIT_ENABLED` and `DANS_REDIS_URL_FILE` settings and the Redis service. See [rate limiting](../docs/cli.md#rate-limiting) for limits and the optional policy file.
+Both examples enable per-identity rate limiting and run their own Redis for it. Redis holds only disposable bucket state: it runs without persistence, needs no backup, and may be restarted or flushed at any time, which resets every bucket to full. If Redis is unavailable, DANS admits requests unmetered and logs `rate_limit.fail_open` warnings; readiness does not depend on it. Redis joins only a private network shared with DANS, and DANS authenticates as an ACL user that can run only the bucket script's commands on `dans:rl:*` keys and `PING` for health checks. To run without rate limiting, remove the `DANS_RATE_LIMIT_ENABLED` and `DANS_REDIS_URL_FILE` settings and the Redis service. See [rate limiting](../docs/cli.md#rate-limiting) for limits and the optional policy file.
 
 Generate one random password and write it into two secret files: the Redis URL for DANS and the ACL file for Redis.
 
@@ -19,7 +19,7 @@ umask 077
 password=$(openssl rand -hex 32)
 printf 'redis://dans:%s@redis:6379/0\n' "$password" >/secure/dans/redis-url
 printf '%s\n' 'user default off' \
-  "user dans on >$password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time" \
+  "user dans on >$password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time +ping" \
   >/secure/dans/redis-users.acl
 ```
 

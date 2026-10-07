@@ -1,6 +1,11 @@
 package ratelimit
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"log/slog"
+	"net"
 	"slices"
 	"strings"
 	"testing"
@@ -42,6 +47,89 @@ func TestNewRedisClientValidatesURLWithoutConnecting(t *testing.T) {
 	}
 	if _, err := NewRedisClient("redis://127.0.0.1:1", 0); err == nil {
 		t.Error("NewRedisClient accepted a zero timeout")
+	}
+}
+
+func TestRedisTLSHandshakeFailsOpenWithinTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		clientTimeout  time.Duration
+		limiterTimeout time.Duration
+		cancelCaller   bool
+	}{
+		{name: "client timeout", clientTimeout: 25 * time.Millisecond, limiterTimeout: time.Second},
+		{name: "limiter deadline", clientTimeout: time.Second, limiterTimeout: 25 * time.Millisecond},
+		{name: "canceled caller", clientTimeout: time.Second, limiterTimeout: time.Second, cancelCaller: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handshakeStarted := make(chan struct{})
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+					return
+				}
+				close(handshakeStarted)
+				if test.cancelCaller {
+					cancel()
+				}
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+			t.Cleanup(func() {
+				_ = listener.Close()
+				<-serverDone
+			})
+
+			client, err := NewRedisClient("rediss://"+listener.Addr().String(), test.clientTimeout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close() })
+			backend, err := NewRedisBackend(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logs := new(bytes.Buffer)
+			limiter, err := NewLimiter(LimiterConfig{
+				Table: NewBuiltinTable(), Backend: backend, Timeout: test.limiterTimeout,
+				Reporter: NewReporter(slog.New(slog.NewJSONHandler(logs, nil)), time.Second, nil),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			decision := limiter.Admit(ctx, Request{IdentityID: testIdentity, Operation: "listZones"})
+			if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+				t.Errorf("stalled TLS handshake took %s, want prompt fail-open", elapsed)
+			}
+			if decision.Outcome != OutcomeUnmetered {
+				t.Fatalf("outcome = %s, want unmetered", decision.Outcome)
+			}
+			select {
+			case <-handshakeStarted:
+			default:
+				t.Fatal("client did not start the TLS handshake")
+			}
+			if test.cancelCaller {
+				if logs.Len() != 0 {
+					t.Errorf("canceled caller reported as backend failure: %s", logs)
+				}
+			} else if !strings.Contains(logs.String(), `"reason":"timeout"`) {
+				t.Errorf("missing timeout warning: %s", logs)
+			}
+		})
 	}
 }
 

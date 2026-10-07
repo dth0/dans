@@ -102,7 +102,7 @@ printf '%s\n' 'dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' >"$work/powe
 redis_password=$(openssl rand -hex 32)
 printf 'redis://dans:%s@redis:6379/0\n' "$redis_password" >"$work/redis-url"
 printf '%s\n' 'user default off' \
-  "user dans on >$redis_password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time" >"$work/redis-users.acl"
+  "user dans on >$redis_password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time +ping" >"$work/redis-users.acl"
 cat >"$work/openssl.cnf" <<'EOF'
 [req]
 distinguished_name = subject

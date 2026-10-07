@@ -224,6 +224,9 @@ func TestRateLimitThrottleResponseFormat(t *testing.T) {
 	if calls := limiter.calls(); len(calls) != 1 || calls[0].IdentityID != limitedIdentity || calls[0].Operation != "listZones" {
 		t.Fatalf("limiter requests = %+v", calls)
 	}
+	if got := lastAccessLog(t, app.logs)["actor_id"]; got != limitedIdentity {
+		t.Errorf("throttled actor ID = %v, want %s", got, limitedIdentity)
+	}
 }
 
 func TestRateLimitCapacityResponseFormat(t *testing.T) {
@@ -248,6 +251,9 @@ func TestRateLimitCapacityResponseFormat(t *testing.T) {
 	}
 	if intents, _ := app.mutations.snapshot(); len(intents) != 0 || app.upstreamCalls.Load() != 0 {
 		t.Fatal("over-capacity request wrote an intent or reached PowerDNS")
+	}
+	if got := lastAccessLog(t, app.logs)["actor_id"]; got != limitedIdentity {
+		t.Errorf("over-capacity actor ID = %v, want %s", got, limitedIdentity)
 	}
 }
 
