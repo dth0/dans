@@ -118,6 +118,39 @@ PowerDNS zone list/get/export and search-data are shared authenticated reads. Zo
 
 See [policy.md](policy.md) for selector examples, PTR/apex/literal-wildcard behavior, route classes, and v1 limitations. See [cli.md](cli.md) for every supported command/configuration workflow. Rare pinned PowerDNS operations without a dedicated CLI command remain available through this generated client; DANS intentionally has no generic raw-request CLI command.
 
+## Rate limiting
+
+When a server enables rate limiting (see [cli.md](cli.md#rate-limiting)), every authenticated request is metered against token buckets owned by its identity. All API tokens and browser sessions of one identity share its buckets; separate identities never share. DANS operators are metered too. `/livez`, `/readyz`, contract-invalid requests, and requests without a valid credential are not metered.
+
+Each request costs one token from the identity's request bucket and one from its operation bucket. A zone `PATCH` also costs 2 change tokens per `REPLACE` RRset and 1 per `DELETE`, `EXTEND`, or `PRUNE` RRset; zone creation and deletion cost 2; other operations cost no change tokens. A request is admitted only if every bucket can pay, and then all of them pay; otherwise none does. Metering happens before authorization and audit, so a refused request is never authorized, audited, or forwarded.
+
+A request refused for insufficient tokens receives `429 Too Many Requests`. `X-DANS-RateLimit-Bucket` lists every short bucket (`requests`, `operation`, `changes`), and `Retry-After` gives whole seconds until all of them could pay:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Cache-Control: no-store
+Retry-After: 3
+X-DANS-RateLimit-Bucket: requests, operation
+
+{"error":"Rate exceeded","errors":["bucket: requests","bucket: operation"]}
+```
+
+`Retry-After` is advisory: other requests from the same identity can use refilled tokens first. Clients should back off with jitter rather than retry exactly on schedule.
+
+A request whose cost exceeds a bucket's capacity can never be admitted as sent, so it receives `413` without `Retry-After`; split the batch or ask an operator to raise the identity's limit:
+
+```http
+HTTP/1.1 413 Request Entity Too Large
+Content-Type: application/json
+Cache-Control: no-store
+X-DANS-RateLimit-Bucket: changes
+
+{"error":"request cost exceeds rate-limit capacity","errors":["bucket: changes","cost: 60","capacity: 50"]}
+```
+
+Admitted responses carry no rate-limit headers, so forwarded PowerDNS responses keep their exact status, body, and headers. If the shared rate-limit store is unavailable or slow, DANS admits requests unmetered (it fails open) and also adds no headers; requests that can never fit still receive `413`.
+
 ## Browser sessions
 
 `POST /api/v1/dans/session` accepts one strict JSON object, `{"token":"<existing-api-token>"}`. A successful response is `201` with `expires_at`; the session secret is sent only in a `__Host-dans_session` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, no Domain). The database stores a digest linked to the original token. Sessions expire after at most 168 hours, never renew automatically, and stop working as soon as the original token expires or is revoked or its identity is disabled. Every protected request rechecks current authority. JavaScript does not persist the token in localStorage or sessionStorage.

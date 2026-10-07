@@ -12,7 +12,7 @@ if grep -Fq 'powerdns:8081/api/v1' "$repository/deploy/README.md" ||
 	exit 1
 fi
 
-for secret in database-url powerdns-api-key tls.crt tls.key; do
+for secret in database-url powerdns-api-key redis-url redis-users.acl tls.crt tls.key; do
 	printf 'smoke\n' >"$temporary/$secret"
 done
 
@@ -20,6 +20,8 @@ DANS_IMAGE=dans:smoke \
 DANS_POWERDNS_URL=http://powerdns:8081 \
 DANS_DATABASE_SECRET_FILE="$temporary/database-url" \
 DANS_POWERDNS_SECRET_FILE="$temporary/powerdns-api-key" \
+DANS_REDIS_URL_SECRET_FILE="$temporary/redis-url" \
+DANS_REDIS_ACL_FILE="$temporary/redis-users.acl" \
 DANS_TLS_CERT_FILE="$temporary/tls.crt" \
 DANS_TLS_KEY_FILE="$temporary/tls.key" \
 	docker compose --file "$repository/deploy/docker/compose.yaml" config --quiet

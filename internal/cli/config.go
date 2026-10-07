@@ -36,6 +36,8 @@ const (
 	defaultIdleTimeout                   = "60s"
 	defaultHealthTimeout                 = "5s"
 	defaultShutdownTimeout               = "30s"
+	defaultRateLimitEnabled              = "false"
+	defaultRateLimitRedisTimeout         = "25ms"
 	maxConfigBytes                       = 1 << 20
 )
 
@@ -78,6 +80,10 @@ type Config struct {
 	IdleTimeout                   string `mapstructure:"idle_timeout" json:"idle_timeout"`
 	HealthTimeout                 string `mapstructure:"health_timeout" json:"health_timeout"`
 	ShutdownTimeout               string `mapstructure:"shutdown_timeout" json:"shutdown_timeout"`
+	RateLimitEnabled              string `mapstructure:"rate_limit_enabled" json:"rate_limit_enabled"`
+	RateLimitRedisTimeout         string `mapstructure:"rate_limit_redis_timeout" json:"rate_limit_redis_timeout"`
+	RateLimitPolicyFile           string `mapstructure:"rate_limit_policy_file" json:"rate_limit_policy_file"`
+	RedisURLFile                  string `mapstructure:"redis_url_file" json:"redis_url_file"`
 }
 
 var configBindings = []struct {
@@ -114,6 +120,10 @@ var configBindings = []struct {
 	{key: "idle_timeout", flag: "idle-timeout", env: "DANS_IDLE_TIMEOUT"},
 	{key: "health_timeout", flag: "health-timeout", env: "DANS_HEALTH_TIMEOUT"},
 	{key: "shutdown_timeout", flag: "shutdown-timeout", env: "DANS_SHUTDOWN_TIMEOUT"},
+	{key: "rate_limit_enabled", flag: "rate-limit-enabled", env: "DANS_RATE_LIMIT_ENABLED"},
+	{key: "rate_limit_redis_timeout", flag: "rate-limit-redis-timeout", env: "DANS_RATE_LIMIT_REDIS_TIMEOUT"},
+	{key: "rate_limit_policy_file", flag: "rate-limit-policy-file", env: "DANS_RATE_LIMIT_POLICY_FILE"},
+	{key: "redis_url_file", flag: "redis-url-file", env: "DANS_REDIS_URL_FILE"},
 }
 
 func addConfigFlags(root *cobra.Command) {
@@ -148,6 +158,10 @@ func addConfigFlags(root *cobra.Command) {
 	flags.String("idle-timeout", "", "HTTP keep-alive idle timeout")
 	flags.String("health-timeout", "", "Readiness dependency timeout")
 	flags.String("shutdown-timeout", "", "Graceful shutdown deadline")
+	flags.String("rate-limit-enabled", "", "Meter identities with shared token buckets: true or false (default false)")
+	flags.String("rate-limit-redis-timeout", "", "Rate-limit Redis timeout before failing open (1ms through 1s)")
+	flags.String("rate-limit-policy-file", "", "JSON rate-limit policy with defaults and per-identity overrides")
+	flags.String("redis-url-file", "", "File containing the rate-limit Redis URL")
 }
 
 func loadConfig(cmd *cobra.Command, scope configScope) (Config, error) {
@@ -175,6 +189,8 @@ func loadConfig(cmd *cobra.Command, scope configScope) (Config, error) {
 	v.SetDefault("idle_timeout", defaultIdleTimeout)
 	v.SetDefault("health_timeout", defaultHealthTimeout)
 	v.SetDefault("shutdown_timeout", defaultShutdownTimeout)
+	v.SetDefault("rate_limit_enabled", defaultRateLimitEnabled)
+	v.SetDefault("rate_limit_redis_timeout", defaultRateLimitRedisTimeout)
 
 	configPath, err := selectedConfigPath(cmd)
 	if err != nil {

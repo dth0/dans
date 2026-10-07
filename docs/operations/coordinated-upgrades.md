@@ -27,6 +27,12 @@ Authoritative DNS can continue serving during DANS-only drain and migration;
 the chosen PowerDNS backend's backup or restore procedure may have a separate
 availability impact.
 
+The rate-limit Redis is not part of the backup pair and is never migrated or
+restored. Its bucket state is disposable: leave it running, restart it, or
+flush it at any point in an upgrade, rollback, or restore. Losing it resets
+every bucket to full and changes no authorization, audit, or DNS state.
+Readiness does not depend on Redis.
+
 ## Exercised upgrade and rollback
 
 The required PostgreSQL 16 and 18 integration legs build historical revision

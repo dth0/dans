@@ -16,7 +16,7 @@ fail() {
 [ -f "$harness" ] || fail "missing scripts/integration.sh"
 [ -x "$measurement" ] || fail "missing executable runtime measurement harness"
 
-for service in postgres powerdns powerdns-restored toxiproxy dans-a dans-b dans-restored; do
+for service in postgres powerdns powerdns-restored toxiproxy redis dans-a dans-b dans-restored dans-rl-a dans-rl-b; do
 	grep -Eq "^  $service:" "$compose" || fail "compose service $service is missing"
 done
 
@@ -47,7 +47,19 @@ grep -Fq '${DANS_B_PORT:?}' "$compose" || fail "the second DANS loopback port is
 grep -Fq '${DANS_BAD_KEY_PORT:?}' "$compose" || fail "the fault-instance loopback port is not explicit"
 grep -Fq '${DANS_RESTORED_PORT:?}' "$compose" || fail "the restored-instance loopback port is not explicit"
 grep -Fq 'profiles: [restore]' "$compose" || fail "the restored instance is not isolated behind a profile"
-grep -Fq 'compose --profile faults --profile tools --profile restore down' "$harness" || fail "the restored instance is not included in scoped teardown"
+grep -Fq 'compose --profile faults --profile tools --profile restore --profile ratelimit down' "$harness" || fail "profiled instances are not included in scoped teardown"
+grep -Fq 'redis:8.10.2' "$compose" || fail "Redis 8.10.2 is not pinned"
+grep -Fq 'DANS_REDIS_URL: redis://toxiproxy:16379/0' "$compose" || fail "DANS does not reach Redis through the fault proxy"
+grep -Fq 'profiles: [ratelimit]' "$compose" || fail "the rate-limit pair is not isolated behind a profile"
+grep -Fq '${DANS_RL_A_PORT:?}' "$compose" || fail "the first rate-limit loopback port is not explicit"
+grep -Fq '${DANS_RL_B_PORT:?}' "$compose" || fail "the second rate-limit loopback port is not explicit"
+grep -Fq 'mark_phase ratelimit' "$harness" || fail 'shared rate limiting is not exercised'
+grep -Fq 'toxiproxy toggle redis' "$harness" || fail 'a Redis outage is not injected'
+grep -Fq 'redis-slow' "$harness" || fail 'a slow Redis is not injected'
+grep -Fq 'resumed rate limiting after Redis recovery' "$harness" || fail 'recovery without restart is not verified'
+if grep -Eq '^[[:space:]]+- "127\.0\.0\.1:[^"]*:6379' "$compose"; then
+	fail "Redis is published to the host"
+fi
 grep -Fq '${POWERDNS_PORT:?}' "$compose" || fail "the PowerDNS loopback port is not explicit"
 grep -Fq '${POWERDNS_RESTORED_PORT:?}' "$compose" || fail "the restored PowerDNS loopback port is not explicit"
 grep -Fq 'powerdns_restored:/var/lib/powerdns' "$compose" || fail "the restored PowerDNS store is not isolated"

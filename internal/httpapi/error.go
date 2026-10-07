@@ -24,10 +24,15 @@ const (
 	KindNotFound        ErrorKind = "not_found"
 	KindConflict        ErrorKind = "conflict"
 	KindBodyTooLarge    ErrorKind = "body_too_large"
-	KindUnavailable     ErrorKind = "unavailable"
-	KindBadGateway      ErrorKind = "bad_gateway"
-	KindGatewayTimeout  ErrorKind = "gateway_timeout"
-	KindInternal        ErrorKind = "internal"
+	// KindRateLimited is a retryable throttle: a bucket lacks tokens now.
+	KindRateLimited ErrorKind = "rate_limited"
+	// KindRateLimitCapacity is not retryable: the request cost exceeds a
+	// bucket's capacity, so it can never be admitted as sent.
+	KindRateLimitCapacity ErrorKind = "rate_limit_capacity"
+	KindUnavailable       ErrorKind = "unavailable"
+	KindBadGateway        ErrorKind = "bad_gateway"
+	KindGatewayTimeout    ErrorKind = "gateway_timeout"
+	KindInternal          ErrorKind = "internal"
 )
 
 // ErrorResponse is the PowerDNS-compatible body for a DANS-originated error.
@@ -119,8 +124,10 @@ func statusFor(kind ErrorKind) int {
 		return http.StatusNotFound
 	case KindConflict:
 		return http.StatusConflict
-	case KindBodyTooLarge:
+	case KindBodyTooLarge, KindRateLimitCapacity:
 		return http.StatusRequestEntityTooLarge
+	case KindRateLimited:
+		return http.StatusTooManyRequests
 	case KindUnavailable:
 		return http.StatusServiceUnavailable
 	case KindBadGateway:
@@ -148,6 +155,10 @@ func publicMessage(kind ErrorKind) string {
 		return "conflict"
 	case KindBodyTooLarge:
 		return "request body too large"
+	case KindRateLimited:
+		return "Rate exceeded"
+	case KindRateLimitCapacity:
+		return "request cost exceeds rate-limit capacity"
 	case KindUnavailable:
 		return "service unavailable"
 	case KindBadGateway:

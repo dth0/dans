@@ -48,6 +48,8 @@ pg_restore --list dans-2026-08-14.dump >/dev/null
 sha256sum dans-2026-08-14.dump >dans-2026-08-14.dump.sha256
 ```
 
+The rate-limit Redis holds only disposable bucket state. Do not back it up or restore it; an empty Redis simply starts every identity with full buckets.
+
 Store the database dump, its checksum, the matching PowerDNS backup and verification record, DANS version, and expected schema status together under restricted access. Both backups are security-sensitive: DANS contains token digests and authorization/audit history, while PowerDNS may contain DNSSEC or TSIG secrets. Regularly restore both to isolated stores, run `dans db status` with the matching binary, and verify database row counts and constraints plus the deployment's required zones, records, metadata, and keys before calling the pair verified. Keep raw backups and restore diagnostics out of CI-visible output and artifacts.
 
 ## Restore finalization
@@ -103,6 +105,17 @@ Recovery cannot create, enable, or promote an identity. Investigate and audit wh
 DANS v1 does not support mixed-version rolling upgrades. Follow [coordinated-upgrades.md](coordinated-upgrades.md): verify a backup, drain and stop all old instances, run the target binary's `dans db migrate` with the DDL role, reapply runtime grants, start only the target version, and reopen traffic only after readiness succeeds.
 
 Before a migration, rollback may restart the previous version. After a migration, an in-place binary downgrade is unsupported: restore the matching verified DANS/PowerDNS backup pair, pass authoritative preflight, run restore finalization, and start only the matching older binary. Authoritative DNS continues serving while the DANS management plane is unavailable; if restoring PowerDNS is required, plan its backend-specific availability impact separately.
+
+## Rate-limit Redis outage
+
+When rate limiting is enabled and Redis is unreachable, returns errors, or answers slower than `rate_limit_redis_timeout`, DANS fails open: it admits requests unmetered, including DNS mutations, and keeps reporting ready. Authorization, audit, and PowerDNS behavior are unchanged; only throttling stops.
+
+1. Detect the outage from the structured logs. Each instance logs one `rate_limit.fail_open` warning when an outage starts, then at most one more every 10 seconds with a `suppressed` count of the admissions it did not log individually. The `reason` field is `timeout`, `connection`, or `script`; it never contains the Redis address or credentials. Access-log entries for affected requests carry `"rate_limit":"unmetered"`. Alert on any `rate_limit.fail_open` event.
+2. Check Redis from a host on its private network (`redis-cli -u "$(cat /secure/dans/redis-url)" --no-auth-warning ping`, or the orchestrator's health status). A `script` reason usually means the Redis ACL does not allow the bucket script's commands or keys; compare it with the documented ACL line.
+3. Restore Redis: restart it, or replace it with an empty instance. Nothing needs to be recovered from the old instance. DANS needs no restart; every instance reconnects on its next request.
+4. Confirm recovery: each instance logs one `rate_limit.recovered` event with `unmetered_admissions`, the total admitted without metering during the outage, and access-log entries return to `admitted` or `throttled`.
+
+While Redis is down, the per-instance `max_concurrent_requests` limit remains the only overload control. If unmetered traffic is a concern during a long outage, reduce that limit or restrict ingress rather than disabling DANS. Requests whose cost exceeds a bucket's capacity are still rejected with `413`, because that check needs no Redis.
 
 ## Failed or unknown DNS mutation
 

@@ -55,6 +55,10 @@ spec:
               value: powerdns
             - name: DANS_POWERDNS_API_KEY_FILE
               value: /run/secrets/dans/powerdns-api-key
+            - name: DANS_RATE_LIMIT_ENABLED
+              value: "true"
+            - name: DANS_REDIS_URL_FILE
+              value: /run/secrets/dans/redis-url
           ports:
             - name: http
               containerPort: 8080
@@ -81,6 +85,81 @@ spec:
           secret:
             secretName: dans-runtime
             defaultMode: 0440
+---
+# Disposable rate-limit state shared by the DANS replicas: no persistence,
+# reachable only from DANS pods, and an ACL user limited to bucket commands.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dans-redis
+  namespace: dans
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dans-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dans-redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:8.10.2
+          imagePullPolicy: IfNotPresent
+          args: ["redis-server", "--save", "", "--appendonly", "no", "--aclfile", "/run/secrets/redis/users.acl"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: redis
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: acl
+              mountPath: /run/secrets/redis
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: acl
+          secret:
+            secretName: dans-redis-acl
+            defaultMode: 0440
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dans-redis
+  namespace: dans
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dans-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
 ---
 apiVersion: v1
 kind: Service
@@ -172,6 +251,32 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dans-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dans-redis-from-dans-only
+  namespace: dans
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dans-redis
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dans
+      ports:
+        - protocol: TCP
+          port: 6379
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

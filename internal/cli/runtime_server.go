@@ -11,6 +11,7 @@ import (
 
 	"github.com/ncode/dans/internal/database"
 	"github.com/ncode/dans/internal/httpserver"
+	"github.com/ncode/dans/internal/ratelimit"
 	"github.com/ncode/dans/internal/upstream"
 	"github.com/ncode/dans/internal/webconsole"
 )
@@ -96,6 +97,12 @@ func (runtime *RuntimeServer) Serve(ctx context.Context, config ServeConfig) err
 	if err != nil {
 		return fmt.Errorf("serve runtime: configure health: %w", err)
 	}
+	accessLogger := httpserver.NewJSONLogger(runtime.logOutput, slog.LevelInfo)
+	rateLimiter, closeRateLimiter, err := newRateLimiter(config, accessLogger)
+	if err != nil {
+		return fmt.Errorf("serve runtime: configure rate limiting: %w", err)
+	}
+	defer closeRateLimiter()
 	dans, err := httpserver.NewDANSOperations(httpserver.GeneratedConfig{
 		Store:           store,
 		Upstream:        upstreamClient,
@@ -108,7 +115,7 @@ func (runtime *RuntimeServer) Serve(ctx context.Context, config ServeConfig) err
 	}
 	handler, err := httpserver.NewApplicationHandler(httpserver.ApplicationConfig{
 		Boundary:        configured.boundary,
-		Logger:          httpserver.NewJSONLogger(runtime.logOutput, slog.LevelInfo),
+		Logger:          accessLogger,
 		Authenticator:   authenticator,
 		BrowserSessions: &httpserver.BrowserSessions{Store: store, DevelopmentHTTP: config.DevelopmentHTTP},
 		Schema: func(ctx context.Context) error {
@@ -125,6 +132,7 @@ func (runtime *RuntimeServer) Serve(ctx context.Context, config ServeConfig) err
 		LifecycleFailures: auditHealth,
 		UpstreamID:        config.PowerDNSUpstream,
 		MutationTimeout:   config.PowerDNSTimeout,
+		RateLimiter:       rateLimiter,
 	})
 	if err != nil {
 		return fmt.Errorf("serve runtime: configure HTTP application: %w", err)
@@ -134,6 +142,41 @@ func (runtime *RuntimeServer) Serve(ctx context.Context, config ServeConfig) err
 		return fmt.Errorf("serve runtime: configure HTTP server: %w", err)
 	}
 	return httpserver.ListenAndServe(ctx, httpServer, health, config.ShutdownTimeout)
+}
+
+// newRateLimiter returns nil when rate limiting is disabled, so no Redis
+// client exists and the middleware is not installed. When enabled, the client
+// connects lazily: readiness never waits for or depends on Redis.
+func newRateLimiter(config ServeConfig, logger *slog.Logger) (httpserver.RateLimiter, func(), error) {
+	if !config.RateLimitEnabled {
+		return nil, func() {}, nil
+	}
+	if config.RateLimitPolicy == nil {
+		return nil, nil, errors.New("rate-limit policy is not resolved")
+	}
+	for _, warning := range config.RateLimitWarnings {
+		logger.Warn("rate_limit.policy_warning", "event", "rate_limit.policy_warning", "warning", warning)
+	}
+	client, err := ratelimit.NewRedisClient(config.RedisURL.Value(), config.RateLimitRedisTimeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	backend, err := ratelimit.NewRedisBackend(client)
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	limiter, err := ratelimit.NewLimiter(ratelimit.LimiterConfig{
+		Table:    config.RateLimitPolicy,
+		Backend:  backend,
+		Timeout:  config.RateLimitRedisTimeout,
+		Reporter: ratelimit.NewReporter(logger, ratelimit.DefaultWarningInterval, nil),
+	})
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return limiter, func() { _ = client.Close() }, nil
 }
 
 type overdueIntentCloser interface {

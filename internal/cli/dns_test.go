@@ -174,3 +174,61 @@ func TestZoneDeleteRequiresExplicitConfirmationWithoutRequest(t *testing.T) {
 		t.Fatalf("unconfirmed deletion made %d requests", requests.Load())
 	}
 }
+
+func TestCLIReportsRateLimitsWithoutRetrying(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		headers map[string]string
+		body    string
+		want    []string
+	}{
+		{
+			name: "throttled", status: http.StatusTooManyRequests,
+			headers: map[string]string{"Retry-After": "3", "X-DANS-RateLimit-Bucket": "changes"},
+			body:    `{"error":"Rate exceeded","errors":["bucket: changes"]}`,
+			want:    []string{"429", "rate limited by changes", "retry after 3 seconds"},
+		},
+		{
+			name: "over capacity", status: http.StatusRequestEntityTooLarge,
+			headers: map[string]string{"X-DANS-RateLimit-Bucket": "changes"},
+			body:    `{"error":"request cost exceeds rate-limit capacity","errors":["bucket: changes","cost: 60","capacity: 50"]}`,
+			want:    []string{"413", "exceeds the changes rate-limit capacity", "split the request"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				for key, value := range tc.headers {
+					writer.Header().Set(key, value)
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(tc.status)
+				_, _ = io.WriteString(writer, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("DANS_ENDPOINT", server.URL+"/api/v1")
+			t.Setenv("DANS_API_TOKEN", newTestToken(t))
+
+			var stdout, stderr bytes.Buffer
+			code := Execute(context.Background(), []string{"zones", "list"}, Options{
+				Version: "test", Streams: Streams{Out: &stdout, Err: &stderr}, HTTPClient: server.Client(),
+			})
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1; stderr %q", code, stderr.String())
+			}
+			if requests.Load() != 1 {
+				t.Fatalf("CLI sent %d requests, want exactly 1 (no retry)", requests.Load())
+			}
+			for _, want := range tc.want {
+				if !bytes.Contains(stderr.Bytes(), []byte(want)) {
+					t.Errorf("stderr %q lacks %q", stderr.String(), want)
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want empty", stdout.String())
+			}
+		})
+	}
+}

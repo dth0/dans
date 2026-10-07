@@ -32,6 +32,8 @@ type ApplicationConfig struct {
 	LifecycleFailures LifecycleFailureReporter
 	UpstreamID        string
 	MutationTimeout   time.Duration
+	// RateLimiter is optional; nil leaves rate limiting out of the chain.
+	RateLimiter RateLimiter
 }
 
 // NewApplicationHandler assembles the production middleware and generated
@@ -70,13 +72,18 @@ func NewApplicationHandler(config ApplicationConfig) (http.Handler, error) {
 		return nil, err
 	}
 
-	return Chain(
-		root,
+	middleware := []Middleware{
 		boundary,
 		AccessLog(config.Logger),
 		validation,
 		config.BrowserSessions.Authentication(config.Authenticator),
+	}
+	if config.RateLimiter != nil {
+		middleware = append(middleware, RateLimit(config.RateLimiter))
+	}
+	middleware = append(middleware,
 		Compatibility(CompatibilityConfig{Schema: config.Schema, PowerDNSCompatible: config.PowerDNSReady}),
 		Authorization(config.Denials, config.AuditFailures),
-	), nil
+	)
+	return Chain(root, middleware...), nil
 }

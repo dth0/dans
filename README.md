@@ -17,7 +17,7 @@ The supported evaluation path requires a running Docker daemon, Docker Compose v
 
 ## Five-minute quickstart
 
-The local stack is disposable and intended only for development and evaluation. It builds DANS from this checkout, initializes PostgreSQL and PowerDNS, and creates development-only credentials. Do not expose it publicly or reuse its credentials elsewhere.
+The local stack is disposable and intended only for development and evaluation. It builds DANS from this checkout, initializes PostgreSQL and PowerDNS, starts a private Redis for rate limiting, and creates development-only credentials. Do not expose it publicly or reuse its credentials elsewhere.
 
 Prerequisites are macOS or Linux, Docker with Compose v2, and Make. The quickstart does not require Go on the host.
 
@@ -42,6 +42,8 @@ export DANS_DEV_DNS_PORT=15353
 make up
 make smoke
 ```
+
+The stack enables per-identity rate limiting with the built-in Route 53-style defaults (`DANS_RATE_LIMIT_ENABLED=true`, `DANS_REDIS_URL=redis://redis:6379/0`). Redis runs on the stack's private network without persistence or a host port, so its state disappears with the container. Bursting more than 50 requests from one token returns `429` with `Retry-After`; see [rate limiting](docs/cli.md#rate-limiting) for every setting, default, and the policy file format.
 
 Use `make status` to inspect the stack, `make logs` to follow logs, and `make down` to stop containers while preserving data and credentials. To delete the entire local installation, including PostgreSQL and PowerDNS data and local credentials, explicitly confirm the reset:
 
@@ -123,6 +125,14 @@ make test
 make generate-check
 make integration
 make dev-contract
+```
+
+`make test` runs every unit test, including the rate limiter against its in-memory backend. Redis-backed rate-limit tests run under the `integration` build tag and need a disposable Redis; `make integration` starts one automatically, or run them directly:
+
+```sh
+docker run -d --rm --name dans-redis-test -p 127.0.0.1:56379:6379 redis:8.10.2
+DANS_TEST_REDIS_URL=redis://127.0.0.1:56379/0 go test -tags integration ./internal/ratelimit/
+docker stop dans-redis-test
 ```
 
 Run `make help` for the authoritative list and description of supported commands. `make generate` uses the pinned Go 1.26.5 toolchain so the compressed API artifact matches CI and release builds. `make frontend` installs the pinned lockfile and rebuilds checked-in embedded assets; rebuild them after changing `web/`. For frontend iteration, `npm --prefix web run dev` serves the console and proxies `/api` to the local DANS service. Install the test browser once with `cd web && npx playwright install chromium`. Production requires only the DANS executable, not Node.js.

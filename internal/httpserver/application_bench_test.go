@@ -20,6 +20,7 @@ import (
 	contractdoc "github.com/ncode/dans/api/openapi"
 	"github.com/ncode/dans/internal/database"
 	"github.com/ncode/dans/internal/httpapi"
+	"github.com/ncode/dans/internal/ratelimit"
 	"github.com/ncode/dans/internal/upstream"
 )
 
@@ -243,6 +244,72 @@ func BenchmarkApplicationStubbed(b *testing.B) {
 			}
 			if err := benchmarkResponseError(&writer, status); err != nil {
 				b.Fatal(err)
+			}
+		})
+	}
+}
+
+// BenchmarkApplicationStubbedRateLimited adds the rate-limit middleware to the
+// stubbed application. Its limiter uses the in-memory backend (a stubbed
+// dependency), so results exclude any Redis round trip and must not be read
+// as deployed rate-limiting capacity.
+func BenchmarkApplicationStubbedRateLimited(b *testing.B) {
+	operations, err := ContractOperationIDs()
+	if err != nil {
+		b.Fatal(err)
+	}
+	table, _, err := ratelimit.ParsePolicy([]byte(`{"defaults": {
+		"requests": {"capacity": 1000000000, "refill_per_second": 1000000000},
+		"operations": {"*": {"capacity": 1000000000, "refill_per_second": 1000000000}},
+		"changes": {"capacity": 1000000000, "refill_per_second": 1000000000}
+	}}`), operations)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, size := range []int{0, 1, 100} {
+		name, method, status := "Read", http.MethodGet, http.StatusOK
+		var payload []byte
+		if size > 0 {
+			name, method, status = "Patch"+strconv.Itoa(size), http.MethodPatch, http.StatusNoContent
+			payload = benchmarkPatch(b, size, 1, 0)
+		}
+		b.Run(name, func(b *testing.B) {
+			limiter, err := ratelimit.NewLimiter(ratelimit.LimiterConfig{
+				Table: table, Backend: ratelimit.NewMemoryBackend(nil), Timeout: time.Second,
+				Reporter: ratelimit.NewReporter(nil, 0, nil),
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			client, calls := benchmarkUpstream(b)
+			actor := database.Actor{IdentityID: "00000000-0000-4000-8000-000000000001", TokenID: "00000000-0000-4000-8000-000000000002", Kind: "service"}
+			store := &benchmarkMutationStore{decision: database.AuthorizationDecision{Allowed: true, Actor: actor}}
+			handler := benchmarkApplication(b, ApplicationConfig{
+				Upstream: client, Authenticator: authenticatorFunc(func(context.Context, string) (database.Actor, error) { return actor, nil }),
+				Schema: func(context.Context) error { return nil }, Mutations: store, RateLimiter: limiter,
+			})
+			request := benchmarkRequest(method, payload)
+			writer := benchmarkCapture{benchmarkResponseWriter: benchmarkResponseWriter{header: make(http.Header)}}
+			invoke := func() {
+				benchmarkServe(handler, request, payload, &writer)
+				if err := benchmarkResponseError(&writer, status); err != nil {
+					b.Fatal(err)
+				}
+				if _, limited := writer.header["X-Dans-Ratelimit-Bucket"]; limited {
+					b.Fatal("benchmark request was throttled")
+				}
+			}
+			invoke()
+			warm := calls.Load()
+			b.ReportAllocs()
+			if len(payload) > 0 {
+				b.SetBytes(int64(len(payload)))
+			}
+			for b.Loop() {
+				invoke()
+			}
+			if calls.Load()-warm != int64(b.N) {
+				b.Fatal("incorrect upstream count")
 			}
 		})
 	}

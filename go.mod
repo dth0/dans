@@ -6,6 +6,7 @@ toolchain go1.26.5
 
 require (
 	github.com/getkin/kin-openapi v0.142.0
+	github.com/gomodule/redigo v1.9.3
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/oapi-codegen/nethttp-middleware v1.2.0

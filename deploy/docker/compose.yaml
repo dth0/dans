@@ -15,13 +15,34 @@ services:
       DANS_POWERDNS_URL: ${DANS_POWERDNS_URL:?set the private PowerDNS API URL}
       DANS_POWERDNS_UPSTREAM: ${DANS_POWERDNS_UPSTREAM:-powerdns}
       DANS_POWERDNS_API_KEY_FILE: /run/secrets/powerdns-api-key
+      DANS_RATE_LIMIT_ENABLED: "true"
+      DANS_REDIS_URL_FILE: /run/secrets/redis-url
     secrets:
       - database-url
       - powerdns-api-key
+      - redis-url
     networks:
       - ingress-private
       - database-private
       - powerdns-control
+      - ratelimit-private
+
+  # Disposable rate-limit state: no persistence, no published port, and an ACL
+  # user limited to the scripted bucket commands and DANS bucket keys.
+  redis:
+    image: redis:8.10.2
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--aclfile", "/run/secrets/redis-users.acl"]
+    user: "999:999"
+    read_only: true
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    secrets:
+      - redis-users.acl
+    tmpfs:
+      - /data
+    networks:
+      - ratelimit-private
 
   ingress:
     image: caddy:2-alpine
@@ -55,6 +76,10 @@ secrets:
     file: ${DANS_DATABASE_SECRET_FILE:?set DANS_DATABASE_SECRET_FILE}
   powerdns-api-key:
     file: ${DANS_POWERDNS_SECRET_FILE:?set DANS_POWERDNS_SECRET_FILE}
+  redis-url:
+    file: ${DANS_REDIS_URL_SECRET_FILE:?set DANS_REDIS_URL_SECRET_FILE}
+  redis-users.acl:
+    file: ${DANS_REDIS_ACL_FILE:?set DANS_REDIS_ACL_FILE}
   tls.crt:
     file: ${DANS_TLS_CERT_FILE:?set DANS_TLS_CERT_FILE}
   tls.key:
@@ -64,6 +89,8 @@ networks:
   ingress-public:
     driver: bridge
   ingress-private:
+    internal: true
+  ratelimit-private:
     internal: true
   database-private:
     external: true

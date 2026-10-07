@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/ncode/dans/internal/ratelimit"
 )
 
 type contextKey uint8
@@ -28,6 +30,7 @@ type AccessMetadata struct {
 	resourceID      string
 	operationID     string
 	upstreamOutcome string
+	rateLimit       *ratelimit.Decision
 }
 
 func (metadata *AccessMetadata) SetRoute(template, apiOperationID string) {
@@ -49,6 +52,33 @@ func (metadata *AccessMetadata) SetOperationID(operationID string) {
 
 func (metadata *AccessMetadata) SetUpstreamOutcome(outcome string) {
 	metadata.upstreamOutcome = outcome
+}
+
+// SetRateLimit records a metered request's rate-limit decision.
+func (metadata *AccessMetadata) SetRateLimit(decision ratelimit.Decision) {
+	metadata.rateLimit = &decision
+}
+
+// rateLimitAttributes are logged only for metered requests.
+func (metadata *AccessMetadata) rateLimitAttributes() []any {
+	decision := metadata.rateLimit
+	if decision == nil {
+		return nil
+	}
+	buckets := make([]string, 0, len(decision.Short)+len(decision.Exceeded))
+	for _, bucket := range decision.Short {
+		buckets = append(buckets, string(bucket))
+	}
+	for _, exceeded := range decision.Exceeded {
+		buckets = append(buckets, string(exceeded.Bucket))
+	}
+	return []any{
+		"rate_limit", string(decision.Outcome),
+		"rate_limit_request_cost", decision.RequestCost,
+		"rate_limit_change_cost", decision.ChangeCost,
+		"rate_limit_buckets", buckets,
+		"rate_limit_ms", float64(decision.Latency.Microseconds()) / 1000,
+	}
 }
 
 // NewJSONLogger returns the sole production log encoding.
@@ -89,7 +119,7 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 				if status == 0 {
 					status = http.StatusOK
 				}
-				logger.InfoContext(request.Context(), "http request",
+				attributes := []any{
 					"request_id", RequestIDFromContext(request.Context()),
 					"method", request.Method,
 					"route_template", metadata.routeTemplate,
@@ -100,7 +130,8 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 					"resource_id", metadata.resourceID,
 					"operation_id", metadata.operationID,
 					"upstream_outcome", metadata.upstreamOutcome,
-				)
+				}
+				logger.InfoContext(request.Context(), "http request", append(attributes, metadata.rateLimitAttributes()...)...)
 			}()
 			next.ServeHTTP(writer, request)
 		})

@@ -1,11 +1,59 @@
 export class APIError extends Error {
   status: number;
   uncertain: boolean;
-  constructor(message: string, status = 0, uncertain = false) {
+  /** Seconds a rate-limited caller should wait; absent otherwise. */
+  retryAfter?: number;
+  constructor(
+    message: string,
+    status = 0,
+    uncertain = false,
+    retryAfter?: number,
+  ) {
     super(message);
     this.status = status;
     this.uncertain = uncertain;
+    this.retryAfter = retryAfter;
   }
+}
+/**
+ * Explains a rate-limit refusal. DANS refuses these before authorization or
+ * forwarding, so the request was not applied; the console never retries.
+ */
+function rateLimitError(
+  response: Response,
+  errors: string[],
+): APIError | undefined {
+  const buckets = response.headers.get("X-DANS-RateLimit-Bucket");
+  if (!buckets) return undefined;
+  if (response.status === 429) {
+    const seconds = Number.parseInt(
+      response.headers.get("Retry-After") ?? "",
+      10,
+    );
+    const wait =
+      seconds > 0
+        ? `Wait ${seconds} second${seconds === 1 ? "" : "s"} before trying again.`
+        : "Wait before trying again.";
+    return new APIError(
+      `Rate limit reached (${buckets}). This request was not applied. ${wait}`,
+      429,
+      false,
+      seconds > 0 ? seconds : undefined,
+    );
+  }
+  if (response.status === 413) {
+    const value = (name: string) =>
+      errors.find((entry) => entry.startsWith(name + ": "))?.slice(name.length + 2);
+    const cost = value("cost"),
+      capacity = value("capacity");
+    const sizes =
+      cost && capacity ? ` (cost ${cost}, capacity ${capacity})` : "";
+    return new APIError(
+      `This request exceeds your ${buckets} rate-limit capacity${sizes} and was not applied. Split it into smaller changes or ask an operator to raise your limit.`,
+      413,
+    );
+  }
+  return undefined;
 }
 export async function request<T>(
   path: string,
@@ -38,14 +86,16 @@ export async function request<T>(
   }
   if (!response.ok) {
     let detail = response.statusText;
+    let errors: string[] = [];
     try {
       const body = await response.json();
-      detail =
-        [body.error, ...(body.errors ?? [])].filter(Boolean).join(" — ") ||
-        detail;
+      errors = Array.isArray(body.errors) ? body.errors : [];
+      detail = [body.error, ...errors].filter(Boolean).join(" — ") || detail;
     } catch {
       /* The status still identifies an unsuccessful response. */
     }
+    const limited = rateLimitError(response, errors);
+    if (limited) throw limited;
     const uncertain =
       mutation && (response.status >= 500 || response.status === 408);
     if (

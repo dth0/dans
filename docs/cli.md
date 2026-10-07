@@ -49,6 +49,10 @@ Non-secret values resolve in this order: built-in default, selected JSON file, d
 | `idle_timeout` | `DANS_IDLE_TIMEOUT` | `--idle-timeout` | `60s` |
 | `health_timeout` | `DANS_HEALTH_TIMEOUT` | `--health-timeout` | `5s` |
 | `shutdown_timeout` | `DANS_SHUTDOWN_TIMEOUT` | `--shutdown-timeout` | `30s` |
+| `rate_limit_enabled` | `DANS_RATE_LIMIT_ENABLED` | `--rate-limit-enabled` | `false` |
+| `rate_limit_redis_timeout` | `DANS_RATE_LIMIT_REDIS_TIMEOUT` | `--rate-limit-redis-timeout` | `25ms` |
+| `rate_limit_policy_file` | `DANS_RATE_LIMIT_POLICY_FILE` | `--rate-limit-policy-file` | none (built-in defaults) |
+| `redis_url_file` | `DANS_REDIS_URL_FILE` | `--redis-url-file` | none |
 
 Only these environment names are bound. Empty environment values are treated as unset. JSON configuration represents durations and integer limits as strings, matching their environment and flag forms.
 
@@ -63,10 +67,54 @@ The DANS token, PostgreSQL URL, and PowerDNS key are never accepted as literal J
 | DANS API token | `DANS_API_TOKEN` | `api_token_file` |
 | PostgreSQL URL | `DANS_DATABASE_URL` | `database_url_file` |
 | PowerDNS API key | `DANS_POWERDNS_API_KEY` | `powerdns_api_key_file` |
+| Rate-limit Redis URL | `DANS_REDIS_URL` | `redis_url_file` |
 
 The PowerDNS key may instead come from the explicitly named `powerdns_config_file`, which must contain exactly one plaintext `api-key=...` assignment. No PowerDNS configuration path is discovered automatically.
 
 Secret files may be regular files or symlinks to regular mounted files. DANS reads each source once, removes one terminal LF or CRLF from file-backed secrets, and rejects empty, oversized, NUL-containing, control-character, or malformed values. Secret values are redacted from diagnostics. Environment secrets containing a newline are rejected.
+
+## Rate limiting
+
+`serve` can meter each identity with Route 53-style token buckets shared by every API instance through one Redis-protocol server. It is disabled by default; set `rate_limit_enabled` to `true` and supply the Redis URL secret (`redis://` or `rediss://`, with any password inside the URL) to enable it. When disabled, DANS reads neither the Redis URL nor the policy file and never connects to Redis.
+
+| Setting | Meaning |
+| --- | --- |
+| `rate_limit_enabled` | `true` or `false`. |
+| `rate_limit_redis_timeout` | Longest wait for Redis per request, from `1ms` through `1s`. A slower, failing, or unreachable Redis admits the request unmetered (fail open). |
+| `rate_limit_policy_file` | Optional strict JSON policy. Without it every identity uses the built-in defaults. |
+
+Each authenticated request costs one token from the identity's request bucket and one from its operation bucket. DNS changes also draw from a change-throughput bucket: a zone `PATCH` costs 2 per `REPLACE` and 1 per `DELETE`, `EXTEND`, or `PRUNE` RRset, and zone creation and deletion cost 2. Built-in defaults mirror the AWS Route 53 API throttling limits:
+
+| Bucket | Capacity | Refill per second |
+| --- | --- | --- |
+| Identity requests (all operations) | 50 | 10 |
+| Any operation without its own entry | 50 | 10 |
+| `createZone` | 40 | 2 |
+| `deleteZone` | 40 | 5 |
+| Change throughput | 1500 | 100 |
+
+DANS operators are metered like every other identity; give an operator headroom with a per-identity entry. See [the API reference](api.md#rate-limiting) for the `429` and `413` responses.
+
+### Rate-limit policy file
+
+The policy file is read once at startup. `defaults` overrides the built-in values for everyone; `identities` overrides them for one identity, keyed by its lowercase UUIDv4 resource ID (`dans identities list` shows IDs). Every field is optional and applies per field: an identity entry inherits each value it omits from `defaults`, which inherits from the built-in defaults. In `operations`, `*` names the bucket for operations without their own entry; other keys are API operation IDs from the served contract.
+
+```json
+{
+  "defaults": {
+    "requests": {"capacity": 100, "refill_per_second": 20},
+    "operations": {"*": {"capacity": 100, "refill_per_second": 20}, "createZone": {"capacity": 20}},
+    "changes": {"capacity": 3000, "refill_per_second": 200},
+    "change_costs": {"REPLACE": 2, "DELETE": 1, "EXTEND": 1, "PRUNE": 1},
+    "operation_costs": {"createZone": 2, "deleteZone": 2}
+  },
+  "identities": {
+    "8f0a7d4e-3b2c-4d1e-9f6a-5b4c3d2e1f0a": {"changes": {"refill_per_second": 500}}
+  }
+}
+```
+
+Capacities are integers of at least 1, refill rates are positive numbers (fractions such as `0.5` are allowed), and costs are non-negative integers. Unknown properties, operation IDs, or change kinds, an identity key that is not a lowercase UUIDv4, and a flat `operation_costs` entry for `patchZone` (which is charged by change kind) make `serve` exit with status 2. A change capacity below the largest possible single request (200 with built-in costs: 100 `REPLACE` RRsets) is allowed but logged as a `rate_limit.policy_warning` at startup, because such requests always receive `413`.
 
 ## Online workflows
 
@@ -116,6 +164,8 @@ Successful data is written only to stdout. Diagnostics are written only to stder
 | `1` | runtime, transport, or API failure |
 | `2` | invocation or configuration failure |
 | `130` | interrupted or canceled |
+
+When the server's rate limit refuses a request, the command exits with status `1` and its stderr diagnostic names the refusing buckets: a `429` adds the `Retry-After` seconds (for example `rate limited by changes; retry after 3 seconds`), and a `413` explains that the request exceeds the bucket's capacity and must be split. The CLI never retries automatically; rerun the command after the wait, preferably with backoff in automation.
 
 Help, version, and completion are configuration-free and perform no file, network, database, or PowerDNS work:
 

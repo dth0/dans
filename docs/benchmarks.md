@@ -104,6 +104,7 @@ have ten successful measurement rows before its evidence is accepted.
 | Strict JSON | 1/100 RRsets, 32 records per RRset, late duplicate/unknown fields |
 | Contract | GET; 1/10/100 RRsets; roughly 960 KiB body; invalid suffix fields; terminal-handler count verified |
 | Stubbed application | Production middleware/router with stub database dependencies; GET, 1/10/100-RRset PATCH, and partial denial |
+| Stubbed rate-limited application | The stubbed application with the rate-limit middleware enabled; GET and 1/100-RRset PATCH. The limiter uses the in-memory backend (a stubbed dependency) with unreachable limits, so results show middleware and cost-calculation overhead only, never a Redis round trip or deployed throttling capacity |
 | PostgreSQL checks | Valid/unknown/revoked/expired credentials and healthy runtime compatibility |
 | Authorization | 1/100 tuples; 1/100/1000 grants with nonmatching candidates; group, exact, and 100 overlapping grants; partial/full denial |
 | Audit | Real intent/outcome commits with 1/100 RRsets and success/failure outcomes; event links and counts verified |

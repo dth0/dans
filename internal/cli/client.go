@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/ncode/dans/api"
@@ -70,7 +72,57 @@ func requireStatus(operation string, response apiResponse, allowed ...int) error
 			return nil
 		}
 	}
+	if detail := rateLimitDetail(response); detail != "" {
+		return runtimeFailure(fmt.Errorf("%s: DANS API returned %s: %s", operation, response.Status(), detail))
+	}
 	return runtimeFailure(fmt.Errorf("%s: DANS API returned %s", operation, response.Status()))
+}
+
+// rateLimitDetail explains a rate-limit 429 or 413. The CLI never retries:
+// the caller decides when to run the command again.
+func rateLimitDetail(response apiResponse) string {
+	header := responseHeader(response)
+	buckets := header.Get("X-DANS-RateLimit-Bucket")
+	if buckets == "" {
+		return ""
+	}
+	switch response.StatusCode() {
+	case http.StatusTooManyRequests:
+		retry := header.Get("Retry-After")
+		if seconds, err := strconv.ParseInt(retry, 10, 64); err == nil && seconds > 0 {
+			return fmt.Sprintf("rate limited by %s; retry after %d seconds", buckets, seconds)
+		}
+		return fmt.Sprintf("rate limited by %s", buckets)
+	case http.StatusRequestEntityTooLarge:
+		return fmt.Sprintf("request cost exceeds the %s rate-limit capacity; split the request", buckets)
+	default:
+		return ""
+	}
+}
+
+// responseHeader reads the HTTPResponse field that every generated
+// *WithResponses type carries; the shared interface exposes only the body
+// and status.
+func responseHeader(response apiResponse) http.Header {
+	value := reflect.ValueOf(response)
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return nil
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return nil
+	}
+	field := value.FieldByName("HTTPResponse")
+	if !field.IsValid() || !field.CanInterface() {
+		return nil
+	}
+	httpResponse, _ := field.Interface().(*http.Response)
+	if httpResponse == nil {
+		return nil
+	}
+	return httpResponse.Header
 }
 
 func transportFailure(operation string, err error) error {

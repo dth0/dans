@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "requests": {"capacity": 1000000, "refill_per_second": 1000000},
+    "operations": {
+      "*": {"capacity": 1000000, "refill_per_second": 1000000},
+      "createZone": {"capacity": 1000000, "refill_per_second": 1000000},
+      "deleteZone": {"capacity": 1000000, "refill_per_second": 1000000}
+    },
+    "changes": {"capacity": 1000000, "refill_per_second": 1000000}
+  }
+}

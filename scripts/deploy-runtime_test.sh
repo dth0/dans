@@ -23,6 +23,8 @@ export DANS_POWERDNS_NETWORK=$project-powerdns
 export DANS_POWERDNS_URL=http://powerdns:8081
 export DANS_DATABASE_SECRET_FILE=$work/database-url
 export DANS_POWERDNS_SECRET_FILE=$work/powerdns-api-key
+export DANS_REDIS_URL_SECRET_FILE=$work/redis-url
+export DANS_REDIS_ACL_FILE=$work/redis-users.acl
 export DANS_TLS_CERT_FILE=$work/tls.crt
 export DANS_TLS_KEY_FILE=$work/tls.key
 export DANS_DEPLOY_TLS_PORT=${DANS_DEPLOY_TLS_PORT:-$(( 20000 + $$ % 20000 ))}
@@ -97,6 +99,10 @@ ready() {
 mark_phase setup
 printf '%s\n' 'postgres://dans_runtime:dans-runtime@postgres/dans?sslmode=disable' >"$work/database-url"
 printf '%s\n' 'dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' >"$work/powerdns-api-key"
+redis_password=$(openssl rand -hex 32)
+printf 'redis://dans:%s@redis:6379/0\n' "$redis_password" >"$work/redis-url"
+printf '%s\n' 'user default off' \
+  "user dans on >$redis_password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time" >"$work/redis-users.acl"
 cat >"$work/openssl.cnf" <<'EOF'
 [req]
 distinguished_name = subject
@@ -110,7 +116,7 @@ EOF
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$work/openssl.cnf" \
   -keyout "$work/tls.key" -out "$work/tls.crt" >/dev/null 2>&1
 # Only synthetic leaf files are readable; their host parent remains mode 0700.
-chmod 444 "$work/database-url" "$work/powerdns-api-key" "$work/tls.crt" "$work/tls.key"
+chmod 444 "$work/database-url" "$work/powerdns-api-key" "$work/redis-url" "$work/redis-users.acl" "$work/tls.crt" "$work/tls.key"
 docker build --build-arg VERSION=deployment-test --tag "$DANS_IMAGE" "$root"
 image_built=1
 docker network create --internal --label "com.docker.compose.project=$project" "$DANS_DATABASE_NETWORK" >/dev/null
@@ -132,7 +138,7 @@ compose run --rm --no-deps -T dans --output json bootstrap \
 token=$(jq -er '.secret' "$work/bootstrap.json")
 jq -n --arg token "$token" '{token:$token}' >"$work/login.json"
 printf 'X-API-Key: %s\n' "$token" >"$work/token-header"
-compose up --detach dans ingress
+compose up --detach dans ingress redis
 wait_for ready
 if [ "${DANS_DEPLOY_TEST_INJECT_FAILURE:-}" = after-ready ]; then
   fail 'injected failure after readiness'
@@ -140,11 +146,11 @@ fi
 
 mark_phase exercise
 # Inspect actual bindings, including unexpected additional ports on ingress.
-for service in dans postgres powerdns ingress; do
+for service in dans postgres powerdns ingress redis; do
   container=$(compose ps --quiet "$service")
   docker inspect "$container" >"$work/container.json"
   case "$service" in
-    dans | postgres) jq -e '.[0].HostConfig.PortBindings | length == 0' "$work/container.json" >/dev/null ;;
+    dans | postgres | redis) jq -e '.[0].HostConfig.PortBindings | length == 0' "$work/container.json" >/dev/null ;;
     powerdns) jq -e '.[0].HostConfig.PortBindings | keys == ["53/tcp", "53/udp"] and all(.[][]; .HostIp == "127.0.0.1")' "$work/container.json" >/dev/null ;;
     ingress) jq -e '.[0].HostConfig.PortBindings | keys == ["8443/tcp"] and all(.[][]; .HostIp == "127.0.0.1")' "$work/container.json" >/dev/null ;;
   esac
@@ -164,6 +170,14 @@ compose exec -T ingress wget -S -T 2 -O /dev/null "http://$powerdns_ip:8081/" \
 if [ "$probe_status" -eq 0 ] || grep -Eq 'HTTP/[0-9.]+' "$work/upstream-probe"; then
   fail 'ingress can reach the private upstream API'
 fi
+compose exec -T ingress sh -c 'command -v nc' >/dev/null 2>&1 || fail 'ingress lacks nc for the Redis isolation probe'
+if compose exec -T ingress nc -z -w 2 redis 6379 >/dev/null 2>&1; then
+  fail 'ingress can reach the rate-limit Redis'
+fi
+redis_container=$(compose ps --quiet redis)
+for network in $(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' "$redis_container"); do
+  [ "$(docker network inspect --format '{{.Internal}}' "$network")" = true ] || fail 'Redis has a public network'
+done
 
 request 200 /console/
 grep -Fq '<html' "$work/body" || fail 'embedded console is missing'
@@ -203,10 +217,31 @@ request 204 /api/v1/dans/session -X DELETE --cookie "$work/cookies" \
 request 401 /api/v1/dans/me --cookie "$work/replay-cookies"
 request 200 /api/v1/dans/me --header "@$work/token-header"
 
+# Shared rate limiting is active through the private, ACL-protected Redis.
+throttled=0
+attempt=0
+while [ "$attempt" -lt 120 ] && [ "$throttled" -eq 0 ]; do
+  attempt=$(( attempt + 1 ))
+  code=$(curl --disable --silent --noproxy '*' --max-time 5 --cacert "$work/tls.crt" \
+    --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' \
+    --header "@$work/token-header" "$origin/api/v1/dans/me")
+  case "$code" in
+    200) ;;
+    429) throttled=1 ;;
+    *) fail "unexpected HTTP status during rate-limit burst ($code)" ;;
+  esac
+done
+[ "$throttled" -eq 1 ] || fail 'rate limiting never throttled the burst'
+grep -iq '^Retry-After: [1-9]' "$work/headers" || fail 'throttle lacks Retry-After'
+grep -iq '^X-DANS-RateLimit-Bucket: ' "$work/headers" || fail 'throttle lacks the bucket header'
+if compose logs --no-color dans | grep -Fq 'rate_limit.fail_open'; then
+  fail 'DANS could not use the ACL-protected Redis'
+fi
+
 compose logs --no-color >"$work/runtime.log"
 session=${cookie%%;*}
 session=${session#*=}
-for credential in "$token" "$session" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
+for credential in "$token" "$session" "$redis_password" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
   if grep -Fq "$credential" "$work/runtime.log"; then fail 'credential appeared in runtime logs'; fi
 done
 printf '%s\n' 'deployment test: ok'

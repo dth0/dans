@@ -29,6 +29,17 @@ services:
       - powerdns-data:/var/lib/powerdns
     networks: [control, ingress]
 
+  # Disposable rate-limit state: persistence is off and no port is published.
+  redis:
+    image: redis:8.10.2
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks: [control]
+
   dans:
     image: ${COMPOSE_PROJECT_NAME:-dans-dev}:local
     build:
@@ -43,12 +54,16 @@ services:
       DANS_POWERDNS_URL: http://powerdns:8081
       DANS_POWERDNS_UPSTREAM: dev
       DANS_POWERDNS_API_KEY: dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      DANS_RATE_LIMIT_ENABLED: "true"
+      DANS_REDIS_URL: redis://redis:6379/0
     ports:
       - "127.0.0.1:${DANS_DEV_HTTP_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
       powerdns:
+        condition: service_started
+      redis:
         condition: service_started
     networks: [control, ingress]
 

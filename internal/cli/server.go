@@ -9,11 +9,17 @@ import (
 	"time"
 
 	"github.com/ncode/dans/internal/httpapi"
+	"github.com/ncode/dans/internal/httpserver"
+	"github.com/ncode/dans/internal/ratelimit"
 	"github.com/ncode/dans/internal/upstream"
 	"github.com/spf13/cobra"
 )
 
-const maxServeDuration = 24 * time.Hour
+const (
+	maxServeDuration      = 24 * time.Hour
+	maxRateLimitTimeout   = time.Second
+	maxRateLimitPolicyLen = 4 << 20
+)
 
 // ServeConfig is the immutable, secret-aware runtime configuration passed to
 // the production server after Viper and every secret source have been read.
@@ -43,6 +49,13 @@ type ServeConfig struct {
 	IdleTimeout                   time.Duration
 	HealthTimeout                 time.Duration
 	ShutdownTimeout               time.Duration
+	RateLimitEnabled              bool
+	RateLimitRedisTimeout         time.Duration
+	// RedisURL, RateLimitPolicy, and RateLimitWarnings are resolved only when
+	// rate limiting is enabled.
+	RedisURL          httpapi.Secret
+	RateLimitPolicy   *ratelimit.Table
+	RateLimitWarnings []string
 }
 
 // Server owns the long-running API runtime for the serve command.
@@ -72,11 +85,19 @@ func newServeCommand(options Options) *cobra.Command {
 			if err != nil {
 				return invocationFailure(err)
 			}
+			if serveConfig.RateLimitEnabled {
+				if serveConfig.RedisURL, err = loadRedisURL(config); err != nil {
+					return invocationFailure(err)
+				}
+				if serveConfig.RateLimitPolicy, serveConfig.RateLimitWarnings, err = loadRateLimitPolicy(config.RateLimitPolicyFile); err != nil {
+					return invocationFailure(err)
+				}
+			}
 			if options.Server == nil {
-				return serveFailure(errors.New("server runtime is not available"), databaseURL, powerDNSAPIKey)
+				return serveFailure(errors.New("server runtime is not available"), databaseURL, powerDNSAPIKey, serveConfig.RedisURL)
 			}
 			if err := options.Server.Serve(cmd.Context(), serveConfig); err != nil {
-				return serveFailure(err, databaseURL, powerDNSAPIKey)
+				return serveFailure(err, databaseURL, powerDNSAPIKey, serveConfig.RedisURL)
 			}
 			return nil
 		},
@@ -157,6 +178,18 @@ func (config Config) serveLimits() (ServeConfig, error) {
 		return ServeConfig{}, err
 	}
 	result.MaxHeaderBytes = int(maxHeaderBytes)
+	switch config.RateLimitEnabled {
+	case "true":
+		result.RateLimitEnabled = true
+	case "false":
+	default:
+		return ServeConfig{}, errors.New("validate config: rate_limit_enabled must be true or false")
+	}
+	timeout, err := time.ParseDuration(config.RateLimitRedisTimeout)
+	if err != nil || timeout < time.Millisecond || timeout > maxRateLimitTimeout {
+		return ServeConfig{}, errors.New("validate config: rate_limit_redis_timeout must be a duration from 1ms through 1s")
+	}
+	result.RateLimitRedisTimeout = timeout
 
 	client, _, err := upstream.NewHTTPClient(upstream.TransportConfig{
 		URL: result.PowerDNSURL, UnixSocket: result.PowerDNSUnixSocket, Timeout: result.PowerDNSTimeout,
@@ -189,11 +222,34 @@ func int64Setting(name, value string, minimum, maximum int64) (int64, error) {
 	return parsed, nil
 }
 
-func serveFailure(err error, databaseURL, powerDNSAPIKey httpapi.Secret) error {
-	secrets := []httpapi.Secret{databaseURL, powerDNSAPIKey}
-	if parsed, parseErr := url.Parse(databaseURL.Value()); parseErr == nil && parsed.User != nil {
-		if password, ok := parsed.User.Password(); ok {
-			secrets = append(secrets, httpapi.NewSecret(password))
+// loadRateLimitPolicy reads the optional policy file once. Without a file,
+// every identity uses the built-in Route 53-derived defaults.
+func loadRateLimitPolicy(path string) (*ratelimit.Table, []string, error) {
+	if path == "" {
+		return ratelimit.NewBuiltinTable(), nil, nil
+	}
+	data, err := readBoundedConfigFile(path, maxRateLimitPolicyLen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load rate-limit policy: %w", err)
+	}
+	operations, err := httpserver.ContractOperationIDs()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load rate-limit policy: %w", err)
+	}
+	table, warnings, err := ratelimit.ParsePolicy(data, operations)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load rate-limit policy %q: %w", path, err)
+	}
+	return table, warnings, nil
+}
+
+func serveFailure(err error, databaseURL, powerDNSAPIKey httpapi.Secret, others ...httpapi.Secret) error {
+	secrets := append([]httpapi.Secret{databaseURL, powerDNSAPIKey}, others...)
+	for _, connection := range append([]httpapi.Secret{databaseURL}, others...) {
+		if parsed, parseErr := url.Parse(connection.Value()); parseErr == nil && parsed.User != nil {
+			if password, ok := parsed.User.Password(); ok && password != "" {
+				secrets = append(secrets, httpapi.NewSecret(password))
+			}
 		}
 	}
 	return &serveRuntimeError{err: runtimeFailure(fmt.Errorf("serve DANS API: %w", &redactedCause{

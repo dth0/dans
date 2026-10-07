@@ -16,6 +16,7 @@ import (
 	"github.com/getkin/kin-openapi/routers/gorillamux"
 	nethttpmiddleware "github.com/oapi-codegen/nethttp-middleware"
 
+	contractdoc "github.com/ncode/dans/api/openapi"
 	"github.com/ncode/dans/internal/contract"
 	"github.com/ncode/dans/internal/httpapi"
 )
@@ -128,6 +129,22 @@ func NewContractValidation(document *openapi3.T) (Middleware, error) {
 			validated.ServeHTTP(w, request)
 		})
 	}, nil
+}
+
+// ContractOperationIDs returns the canonical operation IDs of the embedded
+// combined contract, as recorded in RouteInfo.
+func ContractOperationIDs() (map[string]struct{}, error) {
+	document, err := contractdoc.Spec()
+	if err != nil || document.Paths == nil {
+		return nil, errors.New("HTTP contract: parse embedded contract")
+	}
+	operations := make(map[string]struct{})
+	for _, pathItem := range document.Paths.Map() {
+		for _, operation := range pathItem.Operations() {
+			operations[canonicalOperationID(operation.OperationID)] = struct{}{}
+		}
+	}
+	return operations, nil
 }
 
 // RouteInfoFromContext returns the operation matched by contract validation.

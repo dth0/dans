@@ -35,6 +35,12 @@ services:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     networks: [control]
 
+  # Disposable shared rate-limit state, reached only through toxiproxy.
+  redis:
+    image: redis:8.10.2
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [control]
+
   dans-a: &dans
     image: ${DANS_IMAGE:?set DANS_IMAGE to the integration image tag}
     build:
@@ -61,6 +67,14 @@ services:
       DANS_READ_TIMEOUT: 8s
       DANS_WRITE_TIMEOUT: 8s
       DANS_SHUTDOWN_TIMEOUT: 3s
+      # Metering is active everywhere; the generous policy keeps it from
+      # throttling the rest of the gate. Older binaries ignore these names.
+      DANS_RATE_LIMIT_ENABLED: "true"
+      DANS_REDIS_URL: redis://toxiproxy:16379/0
+      DANS_RATE_LIMIT_REDIS_TIMEOUT: 200ms
+      DANS_RATE_LIMIT_POLICY_FILE: /dans/ratelimit/generous.json
+    volumes:
+      - ./ratelimit:/dans/ratelimit:ro
     ports:
       - "127.0.0.1:${DANS_A_PORT:?}:8080"
     networks: [control, client, ingress]
@@ -88,6 +102,25 @@ services:
       DANS_POWERDNS_URL: http://powerdns-restored:8081
     ports:
       - "127.0.0.1:${DANS_RESTORED_PORT:?}:8080"
+
+  # A same-version pair with a tight policy for rate-limit scenarios.
+  dans-rl-a:
+    <<: *dans
+    profiles: [ratelimit]
+    environment:
+      <<: *dans-environment
+      DANS_RATE_LIMIT_POLICY_FILE: /dans/ratelimit/tight.json
+    ports:
+      - "127.0.0.1:${DANS_RL_A_PORT:?}:8080"
+
+  dans-rl-b:
+    <<: *dans
+    profiles: [ratelimit]
+    environment:
+      <<: *dans-environment
+      DANS_RATE_LIMIT_POLICY_FILE: /dans/ratelimit/tight.json
+    ports:
+      - "127.0.0.1:${DANS_RL_B_PORT:?}:8080"
 
   cli:
     image: ${DANS_IMAGE:?set DANS_IMAGE to the integration image tag}

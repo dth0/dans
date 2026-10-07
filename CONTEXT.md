@@ -103,3 +103,10 @@ Secrets and operational information, including TSIG secrets, DNSSEC private keys
 
 **Literal wildcard RRset**:
 An RRset whose owner name contains the DNS wildcard label `*`. It requires an exact-name delegation and is not selected implicitly by a glob wildcard.
+
+**Rate-limit bucket**:
+A token bucket owned by one identity that meters its requests (identity-level and per-operation buckets) or its DNS changes (the change-throughput bucket). Bucket state is disposable and shared by all API instances.
+_Avoid_: Quota
+
+**Change cost**:
+The change-throughput tokens a request consumes: per RRset in a zone patch by change kind, or a flat cost for zone creation and deletion.

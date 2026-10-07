@@ -10,6 +10,7 @@ import (
 
 	"github.com/ncode/dans/internal/httpapi"
 	"github.com/ncode/dans/internal/identifier"
+	"github.com/ncode/dans/internal/ratelimit"
 	"github.com/ncode/dans/internal/upstream"
 )
 
@@ -44,6 +45,41 @@ func loadDatabaseURL(config Config) (httpapi.Secret, error) {
 			return nil
 		},
 	})
+}
+
+func loadRedisURL(config Config) (httpapi.Secret, error) {
+	return loadSecret(secretSource{
+		name: "rate-limit Redis URL",
+		env:  "DANS_REDIS_URL",
+		file: config.RedisURLFile,
+		validate: func(value string) error {
+			return ratelimit.ParseRedisURL(value)
+		},
+	})
+}
+
+// readBoundedConfigFile reads one regular, non-secret configuration document.
+func readBoundedConfigFile(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %q: %w", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read %q: not a regular file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("read %q: file exceeds %d bytes", path, limit)
+	}
+	return data, nil
 }
 
 func loadPowerDNSAPIKey(config Config) (httpapi.Secret, error) {

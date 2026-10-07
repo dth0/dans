@@ -44,6 +44,8 @@ export POWERDNS_PORT=${POWERDNS_PORT:-$(( port_base + 2 ))}
 export POWERDNS_RESTORED_PORT=${POWERDNS_RESTORED_PORT:-$(( port_base + 5 ))}
 export DANS_BAD_KEY_PORT=${DANS_BAD_KEY_PORT:-$(( port_base + 3 ))}
 export DANS_RESTORED_PORT=${DANS_RESTORED_PORT:-$(( port_base + 4 ))}
+export DANS_RL_A_PORT=${DANS_RL_A_PORT:-$(( port_base + 6 ))}
+export DANS_RL_B_PORT=${DANS_RL_B_PORT:-$(( port_base + 7 ))}
 footprint_container=
 
 compose() {
@@ -73,7 +75,7 @@ cleanup() {
 		docker container rm "$footprint_container" >/dev/null 2>&1 || true
 	fi
 	if [ "${DANS_QA_KEEP:-0}" != 1 ]; then
-		compose --profile faults --profile tools --profile restore down --volumes --remove-orphans >/dev/null 2>&1 || true
+		compose --profile faults --profile tools --profile restore --profile ratelimit down --volumes --remove-orphans >/dev/null 2>&1 || true
 		docker image rm "$target_image" "$previous_image" >/dev/null 2>&1 || true
 	fi
 	rm -rf "$work/powerdns"
@@ -445,9 +447,10 @@ docker container rm "$footprint_container" >/dev/null
 footprint_container=
 printf '%s\n' "integration: OCI root filesystem $rootfs_bytes bytes"
 mark_phase services
-compose up --detach postgres powerdns toxiproxy
+compose up --detach postgres powerdns toxiproxy redis
 wait_for PostgreSQL compose exec -T postgres pg_isready -h 127.0.0.1 -U dans_ddl -d dans
 toxiproxy create --listen 0.0.0.0:18081 --upstream powerdns:8081 powerdns >/dev/null
+toxiproxy create --listen 0.0.0.0:16379 --upstream redis:6379 redis >/dev/null
 
 export DANS_IMAGE=$previous_image
 compose run --rm --no-deps -T \
@@ -763,6 +766,135 @@ if grep -Eqi '(^|[[:space:]])(seed|reset|fault|introspect|metrics|pprof|profil|b
 	fail 'production CLI exposes a test-only command'
 fi
 
+mark_phase ratelimit
+# A tight-policy pair shares the generous pair's Redis. Scenario identities
+# talk only to the tight pair so generous refills never touch their buckets.
+compose --profile ratelimit up --detach dans-rl-a dans-rl-b
+rl_a_root=http://127.0.0.1:$(compose --profile ratelimit port dans-rl-a 8080 | awk -F: 'END { print $NF }')
+rl_b_root=http://127.0.0.1:$(compose --profile ratelimit port dans-rl-b 8080 | awk -F: 'END { print $NF }')
+wait_for 'rate-limited DANS A readiness' http_is 200 "$rl_a_root/readyz"
+wait_for 'rate-limited DANS B readiness' http_is 200 "$rl_b_root/readyz"
+rl_started=$(docker inspect --format '{{.State.StartedAt}}' "$(compose --profile ratelimit ps --quiet dans-rl-a)" "$(compose --profile ratelimit ps --quiet dans-rl-b)")
+
+rate_reader=$(cli_data '{"kind":"service","handle":"rate-reader"}' dans-a "$operator_token" identities create)
+rate_reader_id=$(printf '%s' "$rate_reader" | jq -er '.id')
+rate_reader_token=$(cli_data '{"label":"integration"}' dans-a "$operator_token" identities tokens create "$rate_reader_id" | jq -er '.secret')
+rate_writer=$(cli_data '{"kind":"service","handle":"rate-writer"}' dans-a "$operator_token" identities create)
+rate_writer_id=$(printf '%s' "$rate_writer" | jq -er '.id')
+rate_writer_token=$(cli_data '{"label":"integration"}' dans-a "$operator_token" identities tokens create "$rate_writer_id" | jq -er '.secret')
+rate_writer_body=$(printf '{"zone_binding_id":"%s","identity_id":"%s","selectors":[{"kind":"glob","value":"*.rate.example.test."}],"record_types":["A"]}' "$forward_binding" "$rate_writer_id")
+create_delegation "$rate_writer_body" >/dev/null
+
+rate_status() {
+	curl --silent --max-time 5 --output /dev/null --write-out '%{http_code}\n' -H "X-API-Key: $2" "$1/api/v1/servers/localhost/zones" || true
+}
+rate_patch() {
+	curl --silent --max-time 5 --dump-header "$work/rate-headers" --output "$work/rate-body" --write-out '%{http_code}' \
+		-X PATCH -H 'Content-Type: application/json' -H "X-API-Key: $rate_writer_token" --data "$2" \
+		"$1/api/v1/servers/localhost/zones/$forward_zone_id" || true
+}
+rate_tokens() {
+	compose exec -T redis redis-cli HGET "dans:rl:{$1}:$2" t
+}
+rate_key_absent() {
+	[ "$(compose exec -T redis redis-cli EXISTS "dans:rl:{$1}:$2")" = 0 ]
+}
+rate_header() {
+	tr -d '\r' <"$work/rate-headers" | awk -v name="$1" 'tolower($0) ~ "^" tolower(name) ":" { sub(/^[^:]*:[[:space:]]*/, ""); print }'
+}
+rate_count() {
+	grep -Fxc "$1" "$work/rate-codes" || true
+}
+
+# Concurrent requests across both instances never overspend the identity bucket.
+rate_burst_started=$(date +%s)
+seq 1 120 | xargs -P 16 -I '{}' sh -c 'if [ $(( $1 % 2 )) -eq 0 ]; then root=$2; else root=$3; fi; curl --silent --max-time 5 --output /dev/null --write-out "%{http_code}\n" -H "X-API-Key: $4" "$root/api/v1/servers/localhost/zones" || true' \
+	_ '{}' "$rl_a_root" "$rl_b_root" "$rate_reader_token" >"$work/rate-codes"
+rate_burst_elapsed=$(( $(date +%s) - rate_burst_started + 1 ))
+rate_admitted=$(rate_count 200)
+rate_throttled=$(rate_count 429)
+[ "$(( rate_admitted + rate_throttled ))" -eq 120 ] || fail "concurrent rate-limit burst returned unexpected statuses: $(sort "$work/rate-codes" | uniq -c | tr '\n' ' ')"
+[ "$rate_admitted" -ge 30 ] || fail "concurrent burst admitted $rate_admitted requests, below the 30-token capacity"
+[ "$rate_admitted" -le "$(( 30 + rate_burst_elapsed + 1 ))" ] || fail "concurrent burst admitted $rate_admitted requests in ${rate_burst_elapsed}s, overspending capacity 30 at 1/s"
+
+# A throttled request receives the documented 429 shape.
+curl --silent --max-time 5 --dump-header "$work/rate-headers" --output "$work/rate-body" \
+	-H "X-API-Key: $rate_reader_token" "$rl_b_root/api/v1/servers/localhost/zones" >/dev/null || true
+head -n 1 "$work/rate-headers" | grep -Fq ' 429' || fail "exhausted identity was not throttled: $(head -n 1 "$work/rate-headers")"
+rate_header X-DANS-RateLimit-Bucket | grep -Fq requests || fail 'throttle did not name the requests bucket'
+rate_retry=$(rate_header Retry-After)
+[ "${rate_retry:-0}" -ge 1 ] || fail "throttle Retry-After was $rate_retry"
+jq -e '.error == "Rate exceeded" and (.errors | index("bucket: requests"))' "$work/rate-body" >/dev/null || fail "throttle body was $(cat "$work/rate-body")"
+
+# Idle state expires after the full-refill time; the 1000/s operation bucket lives about 2s.
+rate_key_absent "$rate_reader_id" op:listZones && fail 'operation bucket state was not stored'
+wait_for 'idle rate-limit state expiry' rate_key_absent "$rate_reader_id" op:listZones
+
+# A change throttle leaves the request buckets untouched.
+rate_replace='{"rrsets":[{"changetype":"REPLACE","name":"one.rate.example.test.","type":"A","ttl":60,"records":[{"content":"192.0.2.60"}]},{"changetype":"REPLACE","name":"two.rate.example.test.","type":"A","ttl":60,"records":[{"content":"192.0.2.61"}]}]}'
+[ "$(rate_patch "$rl_a_root" "$rate_replace")" = 204 ] || fail "cost-4 rate-limit patch was refused: $(cat "$work/rate-body")"
+rate_request_before=$(rate_tokens "$rate_writer_id" req)
+rate_delete='{"rrsets":[{"changetype":"DELETE","name":"one.rate.example.test.","type":"A"}]}'
+[ "$(rate_patch "$rl_b_root" "$rate_delete")" = 429 ] || fail "change-exhausted patch was not throttled: $(cat "$work/rate-body")"
+rate_header X-DANS-RateLimit-Bucket | grep -Fxq changes || fail 'change throttle did not name only the changes bucket'
+rate_request_after=$(rate_tokens "$rate_writer_id" req)
+awk -v before="$rate_request_before" -v after="$rate_request_after" 'BEGIN { exit !(after + 0 >= before + 0) }' ||
+	fail "refused change consumed request tokens ($rate_request_before -> $rate_request_after)"
+assert_dns_contains one.rate.example.test. A 192.0.2.60
+expect_cli_data_error 'throttled CLI change' 'rate limited by changes' "$rate_delete" dans-rl-a "$rate_writer_token" rrsets apply "$forward_zone_id"
+
+# A request that can never fit receives 413 without Retry-After.
+rate_oversized='{"rrsets":[{"changetype":"REPLACE","name":"a.rate.example.test.","type":"A","ttl":60,"records":[{"content":"192.0.2.62"}]},{"changetype":"REPLACE","name":"b.rate.example.test.","type":"A","ttl":60,"records":[{"content":"192.0.2.63"}]},{"changetype":"REPLACE","name":"c.rate.example.test.","type":"A","ttl":60,"records":[{"content":"192.0.2.64"}]}]}'
+[ "$(rate_patch "$rl_a_root" "$rate_oversized")" = 413 ] || fail "over-capacity patch was not rejected with 413: $(cat "$work/rate-body")"
+[ -z "$(rate_header Retry-After)" ] || fail 'over-capacity rejection included Retry-After'
+jq -e '.errors == ["bucket: changes", "cost: 6", "capacity: 4"]' "$work/rate-body" >/dev/null || fail "over-capacity body was $(cat "$work/rate-body")"
+assert_dns_absent a.rate.example.test. A
+
+# Redis outages fail open without affecting readiness, then metering resumes.
+rate_unmetered() {
+	: >"$work/rate-codes"
+	for _ in $(seq 1 40); do
+		rate_status "$rl_a_root" "$rate_reader_token" >>"$work/rate-codes"
+	done
+	[ "$(rate_count 200)" -eq 40 ] || fail "$1: requests were refused while Redis was unavailable: $(sort "$work/rate-codes" | uniq -c | tr '\n' ' ')"
+	assert_http 200 "$rl_a_root/readyz"
+	assert_http 200 "$rl_b_root/readyz"
+}
+rate_recoveries() {
+	compose --profile ratelimit logs --no-color dans-rl-a | grep -Fc '"event":"rate_limit.recovered"' || true
+}
+rate_recovered_after() {
+	rate_status "$rl_a_root" "$rate_reader_token" >/dev/null
+	[ "$(rate_recoveries)" -gt "$1" ]
+}
+rate_recoveries_before=$(rate_recoveries)
+toxiproxy toggle redis >/dev/null
+rate_unmetered 'Redis unreachable'
+toxiproxy toggle redis >/dev/null
+# Each outage is one warning episode; recovery between faults starts a new one.
+wait_for 'metering after Redis returns' rate_recovered_after "$rate_recoveries_before"
+rate_recoveries_before=$(rate_recoveries)
+toxiproxy toxic add --type latency --downstream --toxicName redis-slow --attribute latency=1000 redis >/dev/null
+rate_unmetered 'Redis slower than the timeout'
+toxiproxy toxic remove --toxicName redis-slow redis >/dev/null
+wait_for 'metering after Redis speeds up' rate_recovered_after "$rate_recoveries_before"
+rate_throttle_resumed() {
+	for _ in $(seq 1 80); do
+		[ "$(rate_status "$rl_a_root" "$rate_reader_token")" = 429 ] && return 0
+	done
+	return 1
+}
+wait_for 'resumed rate limiting after Redis recovery' rate_throttle_resumed
+[ "$(docker inspect --format '{{.State.StartedAt}}' "$(compose --profile ratelimit ps --quiet dans-rl-a)" "$(compose --profile ratelimit ps --quiet dans-rl-b)")" = "$rl_started" ] ||
+	fail 'rate-limited instances restarted during the Redis faults'
+compose --profile ratelimit logs --no-color dans-rl-a dans-rl-b >"$work/rate-logs"
+for rate_event in '"reason":"connection"' '"reason":"timeout"' '"event":"rate_limit.recovered"' '"rate_limit":"throttled"' '"rate_limit":"exceeds_capacity"'; do
+	grep -Fq "$rate_event" "$work/rate-logs" || fail "rate-limited instance logs lack $rate_event"
+done
+grep -Fq 'toxiproxy:16379' "$work/rate-logs" && fail 'rate-limit logs exposed the Redis address'
+cat "$work/rate-logs" >>"$work/runtime.log"
+compose --profile ratelimit stop dans-rl-a dans-rl-b >/dev/null
+
 mark_phase restore
 restored_dans_stopped || fail 'restored service started before finalization'
 capture_backup_pair 192.0.2.47
@@ -798,7 +930,7 @@ assert_recovery_preflight || exit 1
 finalize_restored_pair
 
 capture_runtime_logs
-for secret in "$operator_token" "$direct_token" "$group_token" "$replacement_token" "$rollback_token" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
+for secret in "$operator_token" "$direct_token" "$group_token" "$replacement_token" "$rollback_token" "$rate_reader_token" "$rate_writer_token" dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; do
 	if grep -Fq "$secret" "$work/runtime.log"; then
 		fail 'runtime logs exposed a credential'
 	fi

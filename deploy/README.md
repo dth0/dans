@@ -4,10 +4,26 @@ These examples preserve the supported production boundary:
 
 ```text
 client --TLS--> trusted ingress --> private DANS --> PostgreSQL primary
-                                             \--> private PowerDNS API
+                                             |--> private PowerDNS API
+                                             \--> private Redis (rate-limit state)
 ```
 
 PostgreSQL and PowerDNS are external dependencies. The examples do not publish the DANS listener or PowerDNS API, and only DANS receives the PowerDNS key. Authoritative DNS on port 53 remains independent of DANS.
+
+Both examples enable per-identity rate limiting and run their own Redis for it. Redis holds only disposable bucket state: it runs without persistence, needs no backup, and may be restarted or flushed at any time, which resets every bucket to full. If Redis is unavailable, DANS admits requests unmetered and logs `rate_limit.fail_open` warnings; readiness does not depend on it. Redis joins only a private network shared with DANS, and DANS authenticates as an ACL user that can run only the bucket script's commands on `dans:rl:*` keys. To run without rate limiting, remove the `DANS_RATE_LIMIT_ENABLED` and `DANS_REDIS_URL_FILE` settings and the Redis service. See [rate limiting](../docs/cli.md#rate-limiting) for limits and the optional policy file.
+
+Generate one random password and write it into two secret files: the Redis URL for DANS and the ACL file for Redis.
+
+```sh
+umask 077
+password=$(openssl rand -hex 32)
+printf 'redis://dans:%s@redis:6379/0\n' "$password" >/secure/dans/redis-url
+printf '%s\n' 'user default off' \
+  "user dans on >$password ~dans:rl:* resetchannels -@all +eval +evalsha +hmget +hset +pexpire +time" \
+  >/secure/dans/redis-users.acl
+```
+
+Use `rediss://` in the URL if your Redis terminates TLS.
 
 ## Docker or Podman Compose
 
@@ -23,16 +39,18 @@ export DANS_IMAGE=ghcr.io/ncode/dans:RELEASE
 export DANS_POWERDNS_URL=http://powerdns:8081
 export DANS_DATABASE_SECRET_FILE=/secure/dans/database-url
 export DANS_POWERDNS_SECRET_FILE=/secure/dans/powerdns-api-key
+export DANS_REDIS_URL_SECRET_FILE=/secure/dans/redis-url
+export DANS_REDIS_ACL_FILE=/secure/dans/redis-users.acl
 export DANS_TLS_CERT_FILE=/secure/dans/tls.crt
 export DANS_TLS_KEY_FILE=/secure/dans/tls.key
 docker compose --file deploy/docker/compose.yaml up -d
 ```
 
-Use `podman network create --internal ...` and `podman compose --file deploy/docker/compose.yaml up -d` for Podman. Ensure the host secret files are readable by container UID 65532 without making them generally readable. The only published socket is the ingress's TLS port 443; DANS itself joins only private networks.
+Use `podman network create --internal ...` and `podman compose --file deploy/docker/compose.yaml up -d` for Podman. Ensure the host secret files are readable by container UID 65532 (DANS) and, for `redis-users.acl`, UID 999 (Redis) without making them generally readable. The only published socket is the ingress's TLS port 443; DANS itself joins only private networks.
 
 The stock Caddy executable carries the `NET_BIND_SERVICE` file capability. The ingress drops all other capabilities and retains this one so the executable can start, even though its container listener uses port 8443. DANS retains no Linux capabilities.
 
-Ingress also joins an external-facing bridge so Docker can publish its TLS socket. DANS joins only the internal ingress network and the two private dependency networks.
+Ingress also joins an external-facing bridge so Docker can publish its TLS socket. DANS joins only the internal ingress network, the two private dependency networks, and the internal `ratelimit-private` network it shares with Redis.
 
 ## Kubernetes
 
@@ -52,17 +70,22 @@ Create secret objects from files rather than placing plaintext in manifests:
 kubectl create namespace dans --dry-run=client -o yaml | kubectl apply -f -
 kubectl --namespace dans create secret generic dans-runtime \
   --from-file=database-url=/secure/dans/database-url \
-  --from-file=powerdns-api-key=/secure/dans/powerdns-api-key
+  --from-file=powerdns-api-key=/secure/dans/powerdns-api-key \
+  --from-file=redis-url=/secure/dans/redis-url
+kubectl --namespace dans create secret generic dans-redis-acl \
+  --from-file=users.acl=/secure/dans/redis-users.acl
 kubectl --namespace dans create secret tls dans-tls \
   --cert=/secure/dans/tls.crt --key=/secure/dans/tls.key
 kubectl apply --filename deploy/kubernetes/dans.yaml
 ```
 
-The pod runs as UID/GID 65532 with a read-only filesystem and no Linux capabilities. NetworkPolicy admits API traffic only from the trusted ingress and permits DANS egress only to DNS, PostgreSQL, and PowerDNS. The PowerDNS-side policy allows public authoritative DNS on port 53 but admits its HTTP API only from DANS. Adapt the selectors to the actual ingress and dependency labels before applying the policy.
+For Kubernetes, write the Redis URL with the `dans-redis` Service name, `redis://dans:PASSWORD@dans-redis:6379/0`. The single `dans-redis` replica is shared by every DANS replica; losing it only resets buckets.
+
+The pod runs as UID/GID 65532 with a read-only filesystem and no Linux capabilities. NetworkPolicy admits API traffic only from the trusted ingress and permits DANS egress only to DNS, PostgreSQL, PowerDNS, and the `dans-redis` pods, which in turn admit traffic only from DANS and have no egress. The PowerDNS-side policy allows public authoritative DNS on port 53 but admits its HTTP API only from DANS. Adapt the selectors to the actual ingress and dependency labels before applying the policy.
 
 ## Runtime verification
 
-Required CI runs `scripts/deploy-runtime_test.sh postgres:16.14` through the privacy-safe integration entry point. The test layers disposable dependencies and loopback test ports over the Docker example, keeping its Caddyfile, service security settings, and file-secret configuration. It validates TLS with an explicitly trusted synthetic certificate, readiness, embedded console delivery, secure cookie authentication, a DNS write, cross-origin denial, logout, and private listener isolation. An injected failure also verifies cleanup.
+Required CI runs `scripts/deploy-runtime_test.sh postgres:16.14` through the privacy-safe integration entry point. The test layers disposable dependencies and loopback test ports over the Docker example, keeping its Caddyfile, service security settings, and file-secret configuration. It validates TLS with an explicitly trusted synthetic certificate, readiness, embedded console delivery, secure cookie authentication, a DNS write, cross-origin denial, logout, private listener isolation, and a rate-limit throttle through the private, ACL-protected Redis. An injected failure also verifies cleanup.
 
 To run the same check locally, install Docker Compose 2.24.4 or newer, curl, dig, jq, and OpenSSL:
 

@@ -29,6 +29,8 @@ func TestErrorMappingIsStable(t *testing.T) {
 		{KindNotFound, http.StatusNotFound, "not found"},
 		{KindConflict, http.StatusConflict, "conflict"},
 		{KindBodyTooLarge, http.StatusRequestEntityTooLarge, "request body too large"},
+		{KindRateLimited, http.StatusTooManyRequests, "Rate exceeded"},
+		{KindRateLimitCapacity, http.StatusRequestEntityTooLarge, "request cost exceeds rate-limit capacity"},
 		{KindUnavailable, http.StatusServiceUnavailable, "service unavailable"},
 		{KindBadGateway, http.StatusBadGateway, "bad gateway"},
 		{KindGatewayTimeout, http.StatusGatewayTimeout, "gateway timeout"},
@@ -49,6 +51,22 @@ func TestErrorMappingIsStable(t *testing.T) {
 				t.Errorf("ErrorBody(%q) exposed internal cause: %q", tt.kind, body.Error)
 			}
 		})
+	}
+}
+
+func TestRateLimitErrorsCarryPublicDetails(t *testing.T) {
+	t.Parallel()
+
+	err := NewDetailedError(KindRateLimitCapacity, errors.New("policy for identity"), "bucket: changes", "cost: 60", "capacity: 50")
+	body := ErrorBody(err)
+	if StatusCode(err) != http.StatusRequestEntityTooLarge || body.Error != "request cost exceeds rate-limit capacity" {
+		t.Fatalf("capacity error = %d %+v", StatusCode(err), body)
+	}
+	if strings.Join(body.Errors, ",") != "bucket: changes,cost: 60,capacity: 50" {
+		t.Fatalf("details = %v", body.Errors)
+	}
+	if body := ErrorBody(NewError(KindBodyTooLarge, nil)); body.Error == ErrorBody(err).Error {
+		t.Fatal("capacity rejection is indistinguishable from an oversized body")
 	}
 }
 

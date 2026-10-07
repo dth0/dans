@@ -1,0 +1,7 @@
+{
+  "defaults": {
+    "requests": {"capacity": 30, "refill_per_second": 1},
+    "operations": {"*": {"capacity": 1000, "refill_per_second": 1000}},
+    "changes": {"capacity": 4, "refill_per_second": 0.01}
+  }
+}
