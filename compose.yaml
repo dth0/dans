@@ -2,7 +2,7 @@ name: ${COMPOSE_PROJECT_NAME:-dans-dev}
 
 services:
   postgres:
-    image: postgres:16.14
+    image: ${POSTGRES_IMAGE:-postgres:16.14}
     environment:
       POSTGRES_DB: dans
       POSTGRES_USER: dans_ddl
@@ -19,7 +19,7 @@ services:
     networks: [control]
 
   powerdns:
-    image: powerdns/pdns-auth-51:5.1.3
+    image: ${POWERDNS_IMAGE:-powerdns/pdns-auth-51:5.1.3}
     environment:
       PDNS_AUTH_API_KEY: dans_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     ports:
@@ -31,7 +31,7 @@ services:
 
   # Disposable rate-limit state: persistence is off and no port is published.
   redis:
-    image: redis:8.10.2
+    image: ${REDIS_IMAGE:-redis:8.10.2}
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -68,7 +68,7 @@ services:
     networks: [control, ingress]
 
   cli:
-    image: busybox:1.37.0-musl
+    image: ${CLI_IMAGE:-busybox:1.37.0-musl}
     command: ["true"]
     profiles: [tools]
     networks: [control]

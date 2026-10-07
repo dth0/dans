@@ -43,6 +43,27 @@ make up
 make smoke
 ```
 
+To use mirrored or custom dependency images, export these variables before running stack commands:
+
+| Service | Image override | Default image |
+| --- | --- | --- |
+| PostgreSQL | `POSTGRES_IMAGE` | `postgres:16.14` |
+| PowerDNS | `POWERDNS_IMAGE` | `powerdns/pdns-auth-51:5.1.3` |
+| Redis | `REDIS_IMAGE` | `redis:8.10.2` |
+| CLI tools | `CLI_IMAGE` | `busybox:1.37.0-musl` |
+
+The root Compose stack uses each override when it is nonempty; unset or empty variables use the default image. DANS still builds locally from this checkout with a checkout-scoped image tag.
+
+Compose does not load `.envrc` automatically. If it contains your overrides, review the file before authorizing it with `direnv allow`, then run stack commands through direnv:
+
+```sh
+direnv allow
+direnv exec . make up
+direnv exec . make smoke
+```
+
+With direnv's shell hook enabled, ordinary `make up` and `make smoke` also inherit the loaded variables. Without direnv, export the variables directly in your shell. Choose images compatible with the stack configuration and existing data; changing PostgreSQL's major version requires a data migration, not just an image override.
+
 The stack enables per-identity rate limiting with the built-in Route 53-style defaults (`DANS_RATE_LIMIT_ENABLED=true`, `DANS_REDIS_URL=redis://redis:6379/0`). Redis runs on the stack's private network without persistence or a host port, so its state disappears with the container. Bursting more than 50 requests from one token returns `429` with `Retry-After`; see [rate limiting](docs/cli.md#rate-limiting) for every setting, default, and the policy file format.
 
 Use `make status` to inspect the stack, `make logs` to follow logs, and `make down` to stop containers while preserving data and credentials. To delete the entire local installation, including PostgreSQL and PowerDNS data and local credentials, explicitly confirm the reset:
