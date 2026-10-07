@@ -1,16 +1,18 @@
 # syntax=docker/dockerfile:1
 
 ARG GO_VERSION=1.26.5
+ARG GOLANG_IMAGE=golang:${GO_VERSION}-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
+ARG NODE_IMAGE=node:24-alpine
 ARG VERSION=dev
 
-FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS frontend
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION

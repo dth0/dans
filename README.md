@@ -51,8 +51,10 @@ To use mirrored or custom dependency images, export these variables before runni
 | PowerDNS | `POWERDNS_IMAGE` | `powerdns/pdns-auth-51:5.1.3` |
 | Redis | `REDIS_IMAGE` | `redis:8.10.2` |
 | CLI tools | `CLI_IMAGE` | `busybox:1.37.0-musl` |
+| Go builder | `GOLANG_IMAGE` | `golang:1.26.5-alpine` (digest-pinned) |
+| Frontend builder | `NODE_IMAGE` | `node:24-alpine` |
 
-The root Compose stack uses each override when it is nonempty; unset or empty variables use the default image. DANS still builds locally from this checkout with a checkout-scoped image tag.
+The root Compose stack uses each override when it is nonempty; unset or empty variables use the default image. It passes `GOLANG_IMAGE` and `NODE_IMAGE` as Docker build arguments for the Go and frontend stages. DANS still builds locally from this checkout with a checkout-scoped image tag. Direct Docker builds can use the same overrides with `--build-arg`.
 
 Compose does not load `.envrc` automatically. If it contains your overrides, review the file before authorizing it with `direnv allow`, then run stack commands through direnv:
 

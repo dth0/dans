@@ -3,6 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compose=$root/compose.yaml
+dockerfile=$root/Dockerfile
 lifecycle=$root/scripts/dev-stack.sh
 makefile=$root/Makefile
 readme=$root/README.md
@@ -32,6 +33,33 @@ done
 
 grep -Fq 'postgres:16.14' "$compose" || fail "PostgreSQL 16.14 is not pinned"
 grep -Fq 'powerdns/pdns-auth-51:5.1.3' "$compose" || fail "PowerDNS 5.1.3 is not pinned"
+grep -Fq 'FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS frontend' "$dockerfile" || fail "the frontend build ignores NODE_IMAGE"
+grep -Fq 'FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS build' "$dockerfile" || fail "the Go build ignores GOLANG_IMAGE"
+go_version=$(sed -n 's/^ARG GO_VERSION=//p' "$dockerfile")
+default_go_image=$(sed -n 's/^ARG GOLANG_IMAGE=//p' "$dockerfile" | sed "s/\${GO_VERSION}/$go_version/g")
+default_node_image=$(sed -n 's/^ARG NODE_IMAGE=//p' "$dockerfile")
+[ -n "$default_go_image" ] || fail "the Go builder default image is missing"
+[ -n "$default_node_image" ] || fail "the frontend default image is missing"
+
+check_build_images() {
+	config=$(docker compose --env-file /dev/null --file "$compose" config) || fail "Compose configuration is invalid"
+	printf '%s\n' "$config" | grep -Fxq "        GOLANG_IMAGE: $1" || fail "Compose does not pass the expected Go builder image"
+	printf '%s\n' "$config" | grep -Fxq "        NODE_IMAGE: $2" || fail "Compose does not pass the expected frontend image"
+}
+
+(
+	unset GOLANG_IMAGE NODE_IMAGE
+	check_build_images "$default_go_image" "$default_node_image"
+)
+(
+	export GOLANG_IMAGE= NODE_IMAGE=
+	check_build_images "$default_go_image" "$default_node_image"
+)
+(
+	export GOLANG_IMAGE=registry.example.test/golang:custom NODE_IMAGE=registry.example.test/node:custom
+	check_build_images "$GOLANG_IMAGE" "$NODE_IMAGE"
+)
+
 grep -Fq '127.0.0.1:${DANS_DEV_HTTP_PORT:-8080}:8080' "$compose" || fail "DANS is not loopback-bound with an overridable port"
 grep -Fq '127.0.0.1:${DANS_DEV_DNS_PORT:-1053}:53/tcp' "$compose" || fail "PowerDNS TCP is not loopback-bound with an overridable port"
 grep -Fq '127.0.0.1:${DANS_DEV_DNS_PORT:-1053}:53/udp' "$compose" || fail "PowerDNS UDP is not loopback-bound with an overridable port"
