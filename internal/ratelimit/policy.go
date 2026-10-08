@@ -4,12 +4,14 @@ package ratelimit
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ncode/dans/internal/httpapi"
 	"github.com/ncode/dans/internal/identifier"
@@ -34,6 +36,8 @@ const (
 	maxRefill         = 1_000_000_000
 	maxCost           = 1_000_000
 	maxPolicyFileSize = 4 << 20
+	// Leave room for millisecond rounding and the extra expiry second.
+	maxFullRefillMillis = (math.MaxInt64 - int64(time.Second)) / int64(time.Millisecond)
 )
 
 // ChangeKinds are the zone PATCH change types DANS forwards.
@@ -148,8 +152,31 @@ type Override struct {
 	Requests       *BucketOverride           `json:"requests"`
 	Operations     map[string]BucketOverride `json:"operations"`
 	Changes        *BucketOverride           `json:"changes"`
-	ChangeCosts    map[string]int64          `json:"change_costs"`
-	OperationCosts map[string]int64          `json:"operation_costs"`
+	ChangeCosts    costOverrides             `json:"change_costs"`
+	OperationCosts costOverrides             `json:"operation_costs"`
+}
+
+// costOverrides preserves explicit zero costs while rejecting JSON null entries.
+type costOverrides map[string]int64
+
+func (costs *costOverrides) UnmarshalJSON(data []byte) error {
+	var values map[string]*int64
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	if values == nil {
+		*costs = nil
+		return nil
+	}
+	decoded := make(costOverrides, len(values))
+	for _, key := range slices.Sorted(maps.Keys(values)) {
+		if values[key] == nil {
+			return fmt.Errorf("cost %q must be a non-null integer", key)
+		}
+		decoded[key] = *values[key]
+	}
+	*costs = decoded
+	return nil
 }
 
 // BucketOverride sets either or both bucket values.
@@ -189,6 +216,9 @@ func (document Document) Resolve(operations map[string]struct{}) (*Table, []stri
 		}
 		defaults = document.Defaults.apply(defaults)
 	}
+	if err := defaults.validateDurations(); err != nil {
+		return nil, nil, fmt.Errorf("defaults: %w", err)
+	}
 	table := &Table{defaults: defaults, identities: make(map[string]Policy, len(document.Identities))}
 	var warnings []string
 	if warning := capacityWarning("defaults", defaults); warning != "" {
@@ -203,12 +233,45 @@ func (document Document) Resolve(operations map[string]struct{}) (*Table, []stri
 			return nil, nil, fmt.Errorf("identities.%s: %w", identityID, err)
 		}
 		policy := override.apply(defaults)
+		if err := policy.validateDurations(); err != nil {
+			return nil, nil, fmt.Errorf("identities.%s: %w", identityID, err)
+		}
 		table.identities[identityID] = policy
 		if warning := capacityWarning("identity "+identityID, policy); warning != "" {
 			warnings = append(warnings, warning)
 		}
 	}
 	return table, warnings, nil
+}
+
+func (policy Policy) validateDurations() error {
+	for _, entry := range []struct {
+		name   string
+		bucket Bucket
+	}{
+		{"requests", policy.Requests},
+		{"operations.*", policy.DefaultOperation},
+		{"changes", policy.Changes},
+	} {
+		if err := entry.bucket.validateDuration(); err != nil {
+			return fmt.Errorf("%s: %w", entry.name, err)
+		}
+	}
+	for _, operation := range slices.Sorted(maps.Keys(policy.Operations)) {
+		if err := policy.Operations[operation].validateDuration(); err != nil {
+			return fmt.Errorf("operations.%s: %w", operation, err)
+		}
+	}
+	return nil
+}
+
+func (bucket Bucket) validateDuration() error {
+	// Costs that fit a bucket cannot wait longer than its full-refill time.
+	milliseconds := math.Ceil(float64(bucket.Capacity) / bucket.RefillPerSecond * 1000)
+	if milliseconds > float64(maxFullRefillMillis) {
+		return errors.New("full-refill time plus 1s must fit in a time.Duration")
+	}
+	return nil
 }
 
 func capacityWarning(scope string, policy Policy) string {

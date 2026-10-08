@@ -218,3 +218,74 @@ func TestMemoryBackendIgnoresBackwardClockSteps(t *testing.T) {
 		t.Fatal("a backward clock step added tokens")
 	}
 }
+
+func TestMemoryBackendPreservesWatermarkDuringAdmittedBackwardStep(t *testing.T) {
+	for _, expiryOnly := range []bool{false, true} {
+		name := "no double refill"
+		if expiryOnly {
+			name = "expiry follows watermark"
+		}
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeClock()
+			backend := NewMemoryBackend(clock.Now)
+			clock.Advance(100 * time.Second)
+			bucket := charge("backwards-admitted", BucketRequests, 10, 1, 5)
+			if !take(t, backend, bucket).Admitted {
+				t.Fatal("initial request was refused")
+			}
+			bucket.Cost = 1
+			clock.Advance(-10 * time.Second)
+			if !take(t, backend, bucket).Admitted {
+				t.Fatal("request during backward step was refused")
+			}
+			if tokens, ok := backend.Stored(bucket.Key); !ok || tokens != 4 {
+				t.Fatalf("backward-step state = %v, %v, want 4 tokens", tokens, ok)
+			}
+			if expiryOnly {
+				clock.Advance(11 * time.Second)
+				if _, ok := backend.Stored(bucket.Key); !ok {
+					t.Fatal("state expired before the watermark's full-refill time")
+				}
+				clock.Advance(10 * time.Second)
+				if _, ok := backend.Stored(bucket.Key); ok {
+					t.Fatal("state outlived the watermark's full-refill time plus 1s")
+				}
+				return
+			}
+			clock.Advance(10 * time.Second)
+			if !take(t, backend, bucket).Admitted {
+				t.Fatal("request after clock recovery was refused")
+			}
+			if tokens, ok := backend.Stored(bucket.Key); !ok || tokens != 3 {
+				t.Fatalf("recovered state = %v, %v, want 3 tokens without double refill", tokens, ok)
+			}
+			clock.Advance(time.Second)
+			if !take(t, backend, bucket).Admitted {
+				t.Fatal("request after new forward progress was refused")
+			}
+			if tokens, ok := backend.Stored(bucket.Key); !ok || tokens != 3 {
+				t.Fatalf("forward state = %v, %v, want normal refill to resume", tokens, ok)
+			}
+		})
+	}
+}
+
+func TestMemoryBackendLongExpiryDoesNotOverflow(t *testing.T) {
+	clock := newFakeClock()
+	backend := NewMemoryBackend(clock.Now)
+	clock.Advance(time.Hour)
+	maxMillis := int64((time.Duration(math.MaxInt64) - time.Second) / time.Millisecond)
+	rate := math.Nextafter(1000/float64(maxMillis), math.Inf(1))
+	bucket := charge("long-expiry", BucketRequests, 1, rate, 1)
+	if !take(t, backend, bucket).Admitted {
+		t.Fatal("full bucket was not admitted")
+	}
+	clock.Advance(time.Hour)
+	if _, ok := backend.Stored(bucket.Key); !ok {
+		t.Fatal("long-lived state expired due to arithmetic overflow")
+	}
+	result := take(t, backend, bucket)
+	if result.Admitted || result.Wait <= 0 {
+		t.Fatalf("result = %+v, want a positive retry wait", result)
+	}
+}

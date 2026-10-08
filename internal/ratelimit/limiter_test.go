@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -168,6 +170,41 @@ func TestLimiterReportsShortBucketsAndWait(t *testing.T) {
 	other := limiter.Admit(context.Background(), Request{IdentityID: testIdentity, Operation: "listZones"})
 	if other.Outcome != OutcomeAdmitted {
 		t.Fatalf("other operation = %s, want admitted while identity bucket has tokens", other.Outcome)
+	}
+}
+
+func TestDeploymentPolicyThrottlesSlowRequests(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "integration", "ratelimit", "deployment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, warnings, err := ParsePolicy(data, testOperations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("deployment policy warnings = %v", warnings)
+	}
+	capacity := table.For(testIdentity).Requests.Capacity
+	for _, spacing := range []time.Duration{0, 100 * time.Millisecond, 5 * time.Second} {
+		t.Run(spacing.String(), func(t *testing.T) {
+			clock := newFakeClock()
+			limiter := newTestLimiter(t, table, NewMemoryBackend(clock.Now), new(bytes.Buffer))
+			request := Request{IdentityID: testIdentity, Operation: "listZones"}
+			for attempt := int64(0); attempt < capacity; attempt++ {
+				if decision := limiter.Admit(context.Background(), request); decision.Outcome != OutcomeAdmitted {
+					t.Fatalf("request %d = %s, want admitted", attempt+1, decision.Outcome)
+				}
+				clock.Advance(spacing)
+			}
+			decision := limiter.Admit(context.Background(), request)
+			if decision.Outcome != OutcomeThrottled || !slices.Equal(decision.Short, []BucketName{BucketRequests}) {
+				t.Fatalf("capacity-plus-one request = %+v, want requests throttle", decision)
+			}
+			if decision.RetryAfter <= 0 {
+				t.Fatalf("retry after = %s, want positive", decision.RetryAfter)
+			}
+		})
 	}
 }
 

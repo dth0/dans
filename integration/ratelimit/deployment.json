@@ -1,0 +1,5 @@
+{
+  "defaults": {
+    "requests": {"capacity": 16, "refill_per_second": 0.001}
+  }
+}

@@ -146,6 +146,18 @@ func TestServeRejectsInvalidRateLimitSecretsAndPolicies(t *testing.T) {
 		args []string
 	}{
 		"malformed URL": {env: map[string]string{"DANS_REDIS_URL": "postgres://user:redis-secret@db/dans"}},
+		"invalid database": {
+			env: map[string]string{"DANS_REDIS_URL": "redis://user:redis-secret@redis.internal/not-a-db"},
+		},
+		"out-of-range port": {
+			env: map[string]string{"DANS_REDIS_URL": "redis://user:redis-secret@redis.internal:65536/0"},
+		},
+		"invalid database in file": {
+			args: []string{"--redis-url-file", writeConfigFile(t, dir, "bad-database-url", "rediss://user:redis-secret@redis.internal/not-a-db\n")},
+		},
+		"out-of-range port in file": {
+			args: []string{"--redis-url-file", writeConfigFile(t, dir, "bad-port-url", "rediss://user:redis-secret@redis.internal:65536/0\n")},
+		},
 		"competing URL sources": {
 			env:  map[string]string{"DANS_REDIS_URL": "redis://redis:6379"},
 			args: []string{"--redis-url-file", writeConfigFile(t, dir, "url", "redis://:redis-secret@redis:6379")},
@@ -153,6 +165,14 @@ func TestServeRejectsInvalidRateLimitSecretsAndPolicies(t *testing.T) {
 		"invalid policy": {
 			env:  map[string]string{"DANS_REDIS_URL": "redis://:redis-secret@redis:6379"},
 			args: []string{"--rate-limit-policy-file", writeConfigFile(t, dir, "bad.json", `{"defaults":{"requests":{"capacity":0}}}`)},
+		},
+		"null costs": {
+			env:  map[string]string{"DANS_REDIS_URL": "redis://:redis-secret@redis:6379"},
+			args: []string{"--rate-limit-policy-file", writeConfigFile(t, dir, "null-costs.json", `{"defaults":{"change_costs":{"REPLACE":null},"operation_costs":{"createZone":null}}}`)},
+		},
+		"unrepresentable bucket duration": {
+			env:  map[string]string{"DANS_REDIS_URL": "redis://:redis-secret@redis:6379"},
+			args: []string{"--rate-limit-policy-file", writeConfigFile(t, dir, "slow-refill.json", `{"defaults":{"requests":{"capacity":1,"refill_per_second":1e-20}}}`)},
 		},
 		"unknown operation": {
 			env:  map[string]string{"DANS_REDIS_URL": "redis://:redis-secret@redis:6379"},
@@ -173,7 +193,7 @@ func TestServeRejectsInvalidRateLimitSecretsAndPolicies(t *testing.T) {
 			if code != 2 || server.calls != 0 {
 				t.Fatalf("exit code = %d, calls = %d, stderr = %q", code, server.calls, stderr)
 			}
-			if strings.Contains(stderr, "redis-secret") {
+			if strings.Contains(stderr, "redis-secret") || strings.Contains(stderr, "redis.internal") || strings.Contains(stderr, "not-a-db") {
 				t.Fatalf("diagnostic exposed the Redis secret: %q", stderr)
 			}
 		})

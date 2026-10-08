@@ -18,7 +18,7 @@ type MemoryBackend struct {
 type memoryBucket struct {
 	tokens  float64
 	updated time.Duration
-	expires time.Duration
+	expires time.Time
 }
 
 // NewMemoryBackend creates an empty backend. A nil clock uses time.Now.
@@ -36,13 +36,17 @@ func (backend *MemoryBackend) Take(ctx context.Context, charges []Charge) (TakeR
 	}
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
-	now := backend.now().Sub(backend.epoch)
+	now := backend.now()
+	elapsed := now.Sub(backend.epoch)
 	tokens := make([]float64, len(charges))
+	watermarks := make([]time.Duration, len(charges))
 	var result TakeResult
 	for index, charge := range charges {
 		available := float64(charge.Bucket.Capacity)
-		if stored, ok := backend.buckets[charge.Key]; ok && now < stored.expires {
-			available = refill(charge.Bucket, stored.tokens, stored.updated, now)
+		watermarks[index] = elapsed
+		if stored, ok := backend.buckets[charge.Key]; ok && now.Before(stored.expires) {
+			available = refill(charge.Bucket, stored.tokens, stored.updated, elapsed)
+			watermarks[index] = max(elapsed, stored.updated)
 		}
 		tokens[index] = available
 		if available < float64(charge.Cost) {
@@ -56,8 +60,8 @@ func (backend *MemoryBackend) Take(ctx context.Context, charges []Charge) (TakeR
 	for index, charge := range charges {
 		backend.buckets[charge.Key] = memoryBucket{
 			tokens:  tokens[index] - float64(charge.Cost),
-			updated: now,
-			expires: now + fullRefillTTL(charge.Bucket),
+			updated: watermarks[index],
+			expires: backend.epoch.Add(watermarks[index]).Add(fullRefillTTL(charge.Bucket)),
 		}
 	}
 	result.Admitted = true
@@ -69,7 +73,7 @@ func (backend *MemoryBackend) Stored(key string) (float64, bool) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	stored, ok := backend.buckets[key]
-	if !ok || backend.now().Sub(backend.epoch) >= stored.expires {
+	if !ok || !backend.now().Before(stored.expires) {
 		return 0, false
 	}
 	return stored.tokens, true

@@ -218,9 +218,12 @@ request 401 /api/v1/dans/me --cookie "$work/replay-cookies"
 request 200 /api/v1/dans/me --header "@$work/token-header"
 
 # Shared rate limiting is active through the private, ACL-protected Redis.
+# The test policy refills one request token every 1000s, well beyond the
+# capacity-plus-one probe even when every curl uses its full 5s timeout.
+probe_requests=$(jq -er '.defaults.requests.capacity + 1' "$root/integration/ratelimit/deployment.json")
 throttled=0
 attempt=0
-while [ "$attempt" -lt 120 ] && [ "$throttled" -eq 0 ]; do
+while [ "$attempt" -lt "$probe_requests" ] && [ "$throttled" -eq 0 ]; do
   attempt=$(( attempt + 1 ))
   code=$(curl --disable --silent --noproxy '*' --max-time 5 --cacert "$work/tls.crt" \
     --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' \

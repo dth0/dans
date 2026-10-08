@@ -77,6 +77,8 @@ Secret files may be regular files or symlinks to regular mounted files. DANS rea
 
 `serve` can meter each identity with Route 53-style token buckets shared by every API instance through one Redis-protocol server. It is disabled by default; set `rate_limit_enabled` to `true` and supply the Redis URL secret (`redis://` or `rediss://`, with any password inside the URL) to enable it. When disabled, DANS reads neither the Redis URL nor the policy file and never connects to Redis.
 
+When enabled, DANS validates the Redis URL's database path and port at startup without contacting Redis. Invalid URLs fail startup with a redacted error; a valid URL does not require Redis to be reachable.
+
 | Setting | Meaning |
 | --- | --- |
 | `rate_limit_enabled` | `true` or `false`. |
@@ -114,7 +116,9 @@ The policy file is read once at startup. `defaults` overrides the built-in value
 }
 ```
 
-Capacities are integers of at least 1, refill rates are positive numbers (fractions such as `0.5` are allowed), and costs are non-negative integers. Unknown properties, operation IDs, or change kinds, an identity key that is not a lowercase UUIDv4, and a flat `operation_costs` entry for `patchZone` (which is charged by change kind) make `serve` exit with status 2. A change capacity below the largest possible single request (200 with built-in costs: 100 `REPLACE` RRsets) is allowed but logged as a `rate_limit.policy_warning` at startup, because such requests always receive `413`.
+Capacities are integers of at least 1, refill rates are positive numbers (fractions such as `0.5` are allowed), and costs are non-negative integers. Explicit numeric zero is valid for costs; `null` cost entries are rejected. Unknown properties, operation IDs, or change kinds, an identity key that is not a lowercase UUIDv4, and a flat `operation_costs` entry for `patchZone` (which is charged by change kind) make `serve` exit with status 2. A change capacity below the largest possible single request (200 with built-in costs: 100 `REPLACE` RRsets) is allowed but logged as a `rate_limit.policy_warning` at startup, because such requests always receive `413`.
+
+After inheritance, each bucket's full-refill time (rounded up to milliseconds, plus a 1-second expiry margin) must fit in Go's duration range, about 292 years. A capacity/refill combination that exceeds this bound makes `serve` exit with status 2.
 
 ## Online workflows
 

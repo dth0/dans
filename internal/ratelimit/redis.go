@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"strconv"
@@ -96,6 +97,18 @@ func ParseRedisURL(rawURL string) error {
 	if err != nil || (parsed.Scheme != "redis" && parsed.Scheme != "rediss") || parsed.Host == "" {
 		return errors.New("must be a redis:// or rediss:// URL")
 	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || number == 0 {
+			return errors.New("Redis URL port must be between 1 and 65535")
+		}
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		// Redigo accepts decimal database numbers that fit in an int.
+		if _, err := strconv.ParseUint(parsed.Path[1:], 10, strconv.IntSize-1); err != nil {
+			return errors.New("invalid Redis URL database")
+		}
+	}
 	return nil
 }
 
@@ -152,6 +165,9 @@ func parseTakeReply(reply []int64, charges int) (TakeResult, error) {
 	case 1:
 		if len(reply) < 3 {
 			return TakeResult{}, errors.New("rate limiter: malformed throttle reply")
+		}
+		if reply[1] < 0 || reply[1] > math.MaxInt64/int64(time.Millisecond) {
+			return TakeResult{}, errors.New("rate limiter: script reply wait out of range")
 		}
 		result := TakeResult{Wait: time.Duration(reply[1]) * time.Millisecond}
 		for _, index := range reply[2:] {

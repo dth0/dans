@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -174,6 +176,73 @@ func TestRedisBackendExpiresIdleState(t *testing.T) {
 	if !take(t, backend, bucket).Admitted {
 		t.Fatal("expired state did not behave as a full bucket")
 	}
+}
+
+func TestRedisBackendSupportsLongestResolvedDuration(t *testing.T) {
+	client := redisClient(t)
+	backend, _ := NewRedisBackend(client)
+	rate := math.Nextafter(1000/float64(maxFullRefillMillis), math.Inf(1))
+	data := []byte(fmt.Sprintf(`{"defaults":{"requests":{"capacity":1,"refill_per_second":%.17g}}}`, rate))
+	table, _, err := ParsePolicy(data, testOperations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := Charge{Name: BucketRequests, Key: uniquePrefix(t) + "long-ttl", Bucket: table.For(testIdentity).Requests, Cost: 1}
+	t.Cleanup(func() { _, _ = redisDo(t, client, "DEL", bucket.Key) })
+	if !take(t, backend, bucket).Admitted {
+		t.Fatal("full bucket was not admitted")
+	}
+	ttl, err := redis.Int64(redisDo(t, client, "PTTL", bucket.Key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 || ttl > maxFullRefillMillis+1000 {
+		t.Fatalf("TTL = %dms, want a positive bounded expiry", ttl)
+	}
+	result := take(t, backend, bucket)
+	if result.Admitted || result.Wait <= 0 {
+		t.Fatalf("result = %+v, want a positive bounded retry wait", result)
+	}
+}
+
+func TestRedisScriptPreservesWatermarkDuringAdmittedBackwardStep(t *testing.T) {
+	client := redisClient(t)
+	key := uniquePrefix(t) + "backwards-admitted"
+	t.Cleanup(func() { _, _ = redisDo(t, client, "DEL", key) })
+	// Replace only TIME in a test-local script to control the clock while
+	// executing the production arithmetic and writes on real Redis.
+	script := strings.Replace(takeScriptSource, "local now = redis.call('TIME')",
+		"local now = {ARGV[#KEYS * 3 + 1], ARGV[#KEYS * 3 + 2]}", 1)
+	if script == takeScriptSource {
+		t.Fatal("script TIME replacement did not match")
+	}
+	run := func(now, cost int64, wantTokens float64) {
+		t.Helper()
+		reply, err := redis.Int64s(redisDo(t, client, "EVAL", script, 1, key, 10, 1, cost, now, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := parseTakeReply(reply, 1)
+		if err != nil || !result.Admitted {
+			t.Fatalf("request at %ds = %+v, %v, want admitted", now, result, err)
+		}
+		tokens, err := redis.Float64(redisDo(t, client, "HGET", key, "t"))
+		if err != nil || tokens != wantTokens {
+			t.Fatalf("tokens at %ds = %v, %v, want %v", now, tokens, err, wantTokens)
+		}
+	}
+	run(100, 5, 5)
+	run(90, 1, 4)
+	watermark, err := redis.Int64(redisDo(t, client, "HGET", key, "u"))
+	if err != nil || watermark != 100_000_000 {
+		t.Fatalf("watermark = %d, %v, want 100000000", watermark, err)
+	}
+	ttl, err := redis.Int64(redisDo(t, client, "PTTL", key))
+	if err != nil || ttl <= 11_000 || ttl > 21_000 {
+		t.Fatalf("TTL = %dms, %v, want the backward-step gap added to 11s", ttl, err)
+	}
+	run(100, 1, 3)
+	run(101, 1, 3)
 }
 
 func TestRedisBackendClassifiesUnavailableServers(t *testing.T) {

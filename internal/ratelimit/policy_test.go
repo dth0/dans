@@ -1,8 +1,11 @@
 package ratelimit
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testIdentity = "8f0a7d4e-3b2c-4d1e-9f6a-5b4c3d2e1f0a"
@@ -163,6 +166,69 @@ func TestParsePolicyRejectsInvalidDocuments(t *testing.T) {
 	}
 }
 
+func TestParsePolicyRejectsNullCosts(t *testing.T) {
+	for name, document := range map[string]string{
+		"default change cost":     `{"defaults":{"change_costs":{"REPLACE":null}}}`,
+		"default operation cost":  `{"defaults":{"operation_costs":{"createZone":null}}}`,
+		"default costs":           `{"defaults":{"change_costs":{"REPLACE":null},"operation_costs":{"createZone":null}}}`,
+		"identity change cost":    `{"identities":{"` + testIdentity + `":{"change_costs":{"REPLACE":null}}}}`,
+		"identity operation cost": `{"identities":{"` + testIdentity + `":{"operation_costs":{"createZone":null}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			table, _, err := ParsePolicy([]byte(document), testOperations)
+			if err == nil || table != nil {
+				t.Fatalf("null cost was accepted: table %v, error %v", table, err)
+			}
+			if !strings.Contains(err.Error(), "decode policy as strict JSON") || !strings.Contains(err.Error(), "null") {
+				t.Fatalf("error = %v, want null rejected during decoding", err)
+			}
+		})
+	}
+}
+
+func TestParsePolicyPreservesExplicitZeroCosts(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		document          string
+		otherIdentityCost int64
+	}{
+		{
+			name:              "defaults",
+			document:          `{"defaults":{"change_costs":{"REPLACE":0},"operation_costs":{"createZone":0}}}`,
+			otherIdentityCost: 0,
+		},
+		{
+			name:              "identity",
+			document:          `{"identities":{"` + testIdentity + `":{"change_costs":{"REPLACE":0},"operation_costs":{"createZone":0}}}}`,
+			otherIdentityCost: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			table, _, err := ParsePolicy([]byte(test.document), testOperations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := table.For(testIdentity)
+			if cost := policy.ChangeCost(PatchZoneOperation, []string{"REPLACE"}); cost != 0 {
+				t.Errorf("explicit zero REPLACE cost = %d", cost)
+			}
+			if cost := policy.ChangeCost("createZone", nil); cost != 0 {
+				t.Errorf("explicit zero createZone cost = %d", cost)
+			}
+			if cost := policy.ChangeCost(PatchZoneOperation, []string{"DELETE"}); cost != 1 {
+				t.Errorf("omitted DELETE cost = %d, want inherited 1", cost)
+			}
+			if cost := policy.ChangeCost("deleteZone", nil); cost != 2 {
+				t.Errorf("omitted deleteZone cost = %d, want inherited 2", cost)
+			}
+			other := table.For("00000000-0000-4000-8000-000000000000")
+			if other.ChangeCosts["REPLACE"] != test.otherIdentityCost || other.OperationCosts["createZone"] != test.otherIdentityCost {
+				t.Errorf("other identity costs = %v, %v, want %d", other.ChangeCosts, other.OperationCosts, test.otherIdentityCost)
+			}
+		})
+	}
+}
+
 func TestParsePolicyWarnsWhenARequestCanNeverFit(t *testing.T) {
 	_, warnings, err := ParsePolicy([]byte(`{
 		"defaults": {"changes": {"capacity": 200}},
@@ -173,5 +239,93 @@ func TestParsePolicyWarnsWhenARequestCanNeverFit(t *testing.T) {
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], testIdentity) || !strings.Contains(warnings[0], "200") {
 		t.Fatalf("warnings = %v, want one warning naming the identity and largest cost", warnings)
+	}
+}
+
+func TestPolicyRejectsUnrepresentableResolvedBuckets(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		document string
+		scope    string
+	}{
+		{"requests", `{"defaults":{"requests":{"capacity":1,"refill_per_second":1e-20}}}`, "defaults: requests"},
+		{"changes", `{"defaults":{"changes":{"capacity":1,"refill_per_second":1e-20}}}`, "defaults: changes"},
+		{"wildcard operation", `{"defaults":{"operations":{"*":{"capacity":1,"refill_per_second":1e-20}}}}`, "defaults: operations.*"},
+		{"named operation", `{"defaults":{"operations":{"listZones":{"capacity":1,"refill_per_second":1e-20}}}}`, "defaults: operations.listZones"},
+		{"division overflow", `{"defaults":{"requests":{"capacity":1,"refill_per_second":1e-320}}}`, "defaults: requests"},
+		{"inherited built-in capacity", `{"defaults":{"requests":{"refill_per_second":1e-10}}}`, "defaults: requests"},
+		{"named operation inherits wildcard refill", `{"defaults":{"operations":{"*":{"capacity":1,"refill_per_second":1e-9},"listZones":{"capacity":50}}}}`, "defaults: operations.listZones"},
+		{
+			"identity inherits capacity",
+			`{"defaults":{"requests":{"capacity":1000000000}},"identities":{"` + testIdentity + `":{"requests":{"refill_per_second":0.001}}}}`,
+			"identities." + testIdentity + ": requests",
+		},
+		{
+			"identity inherits refill",
+			`{"defaults":{"requests":{"refill_per_second":0.000001}},"identities":{"` + testIdentity + `":{"requests":{"capacity":1000000}}}}`,
+			"identities." + testIdentity + ": requests",
+		},
+		{
+			"identity named operation",
+			`{"identities":{"` + testIdentity + `":{"operations":{"listZones":{"refill_per_second":1e-20}}}}}`,
+			"identities." + testIdentity + ": operations.listZones",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			table, _, err := ParsePolicy([]byte(test.document), testOperations)
+			if err == nil || table != nil {
+				t.Fatalf("unsafe duration accepted: table %v, error %v", table, err)
+			}
+			if !strings.Contains(err.Error(), test.scope) || !strings.Contains(err.Error(), "full-refill") {
+				t.Fatalf("error = %v, want scoped full-refill error for %s", err, test.scope)
+			}
+		})
+	}
+}
+
+func TestPolicyRefillDurationBoundary(t *testing.T) {
+	maxMillis := int64((time.Duration(math.MaxInt64) - time.Second) / time.Millisecond)
+	rate := 1000 / float64(maxMillis)
+	for _, test := range []struct {
+		name  string
+		rate  float64
+		valid bool
+	}{
+		{"within bound", math.Nextafter(rate, math.Inf(1)), true},
+		{"beyond bound", math.Nextafter(rate, 0), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			document := fmt.Sprintf(`{"defaults":{"requests":{"capacity":1,"refill_per_second":%.17g}}}`, test.rate)
+			table, _, err := ParsePolicy([]byte(document), testOperations)
+			if !test.valid {
+				if err == nil {
+					t.Fatal("duration beyond the bound accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			bucket := table.For(testIdentity).Requests
+			ttl, wait := fullRefillTTL(bucket), shortfallWait(bucket, 0, 1)
+			if ttl <= time.Second || wait <= 0 || ttl-wait != time.Second {
+				t.Fatalf("TTL %s and wait %s must remain positive with a 1s expiry margin", ttl, wait)
+			}
+		})
+	}
+}
+
+func TestPolicyAcceptsSlowRefillAfterInheritance(t *testing.T) {
+	for name, document := range map[string]string{
+		"defaults capacity and refill":    `{"defaults":{"requests":{"capacity":1,"refill_per_second":1e-9}}}`,
+		"named operation inherits refill": `{"defaults":{"operations":{"*":{"capacity":1,"refill_per_second":1e-9},"listZones":{"capacity":1}}}}`,
+		"identity inherits capacity":      `{"defaults":{"requests":{"capacity":1}},"identities":{"` + testIdentity + `":{"requests":{"refill_per_second":1e-9}}}}`,
+		"identity inherits refill":        `{"defaults":{"requests":{"capacity":1,"refill_per_second":1e-9}},"identities":{"` + testIdentity + `":{"requests":{"capacity":2}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := ParsePolicy([]byte(document), testOperations); err != nil {
+				t.Fatalf("representable resolved duration was rejected: %v", err)
+			}
+		})
 	}
 }

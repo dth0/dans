@@ -1,5 +1,11 @@
 # Runtime fixture layered over the documented deployment; dependencies stay private.
 services:
+  dans:
+    environment:
+      DANS_RATE_LIMIT_POLICY_FILE: /dans/ratelimit/deployment.json
+    volumes:
+      - ${DANS_DEPLOY_ROOT:?}/integration/ratelimit/deployment.json:/dans/ratelimit/deployment.json:ro
+
   ingress:
     ports: !override
       - "127.0.0.1:${DANS_DEPLOY_TLS_PORT:?}:8443"
